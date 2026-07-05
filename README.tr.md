@@ -67,9 +67,9 @@ chmod +x m365-bridge-linux-amd64
 
 M365Bridge'i çalıştırmanın en kolay yolu Docker'dır. Hazır imaj GitHub Container Registry'de mevcuttur.
 
-**Seçenek 1: Docker Compose (önerilen)**
+#### Adım 1: docker-compose.yml oluşturun
 
-Bir `docker-compose.yml` dosyası oluşturun:
+Proje dizininizde bir `docker-compose.yml` dosyası oluşturun:
 
 ```yaml
 services:
@@ -83,7 +83,7 @@ services:
     restart: unless-stopped
 ```
 
-Sunucuyu başlatın:
+#### Adım 2: Container'ı başlatın
 
 ```bash
 docker compose up -d
@@ -91,59 +91,13 @@ docker compose up -d
 
 API `http://localhost:8230` adresinde erişilebilir olacaktır.
 
-**Seçenek 2: Docker run**
+#### Adım 3: Tarayıcıdan kimlik doğrulama token'ını alın
 
-```bash
-docker run -d \
-  --name m365bridge \
-  -p 8230:8000 \
-  -v $(pwd)/data:/app/data \
-  --restart unless-stopped \
-  ghcr.io/kilimcininkoroglu/m365bridge:latest
-```
+Sunucunun, Microsoft 365 Copilot oturumunuzdan bir refresh token'a ihtiyacı var. Şu şekilde çıkarın:
 
-**Seçenek 3: Kaynaktan derleme**
-
-Hazır imaj yerine kendiniz derlemek isterseniz:
-
-```bash
-docker compose up --build -d
-```
-
-**Notlar:**
-
-- `data/` dizini token'ları, önbelleği ve yapılandırmayı saklar. İlk çalıştırmada otomatik oluşturulur.
-- Port `8230` (host) ile `8000` (container) arasında eşleştirilir. Host portunu `docker-compose.yml` veya `-p` parametresinden değiştirebilirsiniz.
-- Container varsayılan olarak `serve --port 8000` ile başlar.
-- Container'ı başlattıktan sonra kimlik doğrulamayı yapılandırmak için kurulum sihirbazını çalıştırın: `docker exec -it m365bridge ./bin/m365-bridge setup-wizard`
-
-## Yapılandırma
-
-Kimlik doğrulamayı yapılandırmak için kurulum sihirbazını çalıştırın:
-
-```bash
-./bin/m365-bridge setup-wizard
-```
-
-Sihirbaz sizi şu adımlarda yönlendirecektir:
-1. Tarayıcınızda https://m365.cloud.microsoft adresine giriş yapma
-2. Refresh token'ı yakalamak için tarayıcı konsolunda bir JavaScript kod parçacığı çalıştırma
-3. JSON çıktısını `data/setup.json` dosyasına kaydetme
-4. Refresh token'ı şifreleme ve depolama
-5. Ortam değişkenlerini `data/.env` dosyasına yazma
-6. (Opsiyonel) 24 saatlik token süresi dolunca otomatik yenileme için SSO cookie'leri yakalama
-
-Sihirbaz, `oid`, `tenant` ve `refresh_token` alanlarını içeren bir JSON dosyasını okur (varsayılan: `data/setup.json`). Refresh token'ı AES-256-GCM ile şifreler, şifreleme anahtarını `data/tokens/encryption.key` dosyasında saklar ve ortam değişkenlerini `data/.env` dosyasına yazar.
-
-> **Token süresi dolması hakkında not:** Microsoft SPA refresh token'ları 24 saat sonra süresi dolar (AADSTS700084). SSO cookie'leri olmadan, kurulum sihirbazını her gün tekrar çalıştırmanız gerekir. Otomatik yenilemeyi etkinleştirmek için kurulum sırasında SSO cookie'lerini yakalayın (aşağıdaki 2. Adıma bakın). SSO cookie'leri haftalarca/aylarca dayanır ve refresh token süresi dolduğunda sunucunun sessizce yeniden kimlik doğrulamasını sağlar.
-
-### Manuel Kurulum
-
-Sihirbaz yerine yapılandırmayı manuel çıkarmayı tercih ederseniz:
-
-1. https://m365.cloud.microsoft adresini açın ve giriş yapın
-2. DevTools'u açmak için F12'ye basın, Console sekmesine geçin
-3. Aşağıdaki JavaScript kod parçacığını yapıştırıp çalıştırın. Bu kod, düz metin refresh token'ı yakalamak için MSAL token yenileme isteklerini araya girer (MSAL.js v3, refresh token'ları localStorage'da şifrelediği için doğrudan localStorage çıkarımı çalışmaz). Ayrıca token yenilemesini tetiklemek için önbelleğe alınmış access token'ları temizler ve interceptor'ı devreye sokar.
+1. Tarayıcınızda [https://m365.cloud.microsoft](https://m365.cloud.microsoft) adresini açın ve giriş yapın
+2. DevTools'u açmak için **F12**'ye basın, **Console** sekmesine geçin
+3. Aşağıdaki JavaScript kodunu yapıştırıp çalıştırın:
 
 <details>
 <summary>JavaScript interceptor kod parçacığını genişletmek için tıklayın</summary>
@@ -164,15 +118,8 @@ window.fetch = async function(...args) {
       const clone = resp.clone();
       const data = await clone.json();
       if (data.refresh_token) {
-        const cookies = document.cookie.split(';').map(c => {
-          const [name, ...rest] = c.trim().split('=');
-          return {name, value: rest.join('=')};
-        }).filter(c => c.name && c.value);
         console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
-        console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
-        console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
-        console.log('Then add them to the sso_cookies array in your setup.json manually.');
+        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
       }
     } catch(e) {}
   }
@@ -191,15 +138,8 @@ XMLHttpRequest.prototype.send = function(body) {
       try {
         const data = JSON.parse(this.responseText);
         if (data.refresh_token) {
-          const cookies = document.cookie.split(';').map(c => {
-            const [name, ...rest] = c.trim().split('=');
-            return {name, value: rest.join('=')};
-          }).filter(c => c.name && c.value);
           console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
-          console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
-          console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
-          console.log('Then add them to the sso_cookies array in your setup.json manually.');
+          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
         }
       } catch(e) {}
     }
@@ -236,25 +176,35 @@ return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL s
 </details>
 
 4. Konsolda şu mesajı bekleyin: `===== COPY THE COMPLETE JSON LINE BELOW =====`
-5. JSON çıktısını kopyalayın (`oid`, `tenant`, `refresh_token` ve `sso_cookies` içerir)
-6. `data/setup.json` dosyasına kaydedin
-7. Yapılandırmayı doğrulamak ve kaydetmek için sihirbazı çalıştırın:
+5. JSON çıktısını kopyalayın. Şu formatta olur:
 
-```bash
-./bin/m365-bridge setup-wizard
+```json
+{"oid":"sizin-oid","tenant":"sizin-tenant","refresh_token":"sizin-refresh-token"}
 ```
 
-Sihirbaz, refresh token'ı AES-256-GCM ile şifreler ve ortam değişkenlerini `data/.env` dosyasına kaydeder.
+#### Adım 4 (Opsiyonel): Otomatik yenileme için SSO cookie'leri alın
 
-### SSO Cookie'leri Yakalama (Opsiyonel, Önerilir)
+Microsoft SPA refresh token'ları **24 saat** sonra süresi dolar. SSO cookie'leri olmadan, 24 saatte bir Adım 3'ü tekrarlamanız gerekir. SSO cookie'leri otomatik yenilemeyi sağlar ve haftalarca/aylarca dayanır.
 
-SSO cookie'leri, 24 saatlik refresh token süresi dolduktan sonra otomatik token yenilemeyi sağlar. Onlar olmadan, kurulum sihirbazını her 24 saatte bir tekrar çalıştırmanız gerekir.
+SSO cookie'lerini yakalamak için:
 
-1. Tarayıcı DevTools'ta **Application** > **Cookies** > `https://login.microsoftonline.com` bölümüne gidin
-2. Şu cookie'lerin değerlerini bulun ve kopyalayın:
+1. Tarayıcınızda [https://login.microsoftonline.com](https://login.microsoftonline.com) adresini açın (cookie'ler burada bulunur, m365.cloud.microsoft'ta değil)
+2. DevTools'u açmak için **F12**'ye basın, **Application** > **Cookies** > `https://login.microsoftonline.com` bölümüne gidin
+3. Şu iki cookie'nin değerlerini bulun ve kopyalayın:
    - `ESTSAUTH`
    - `ESTSAUTHPERSISTENT`
-3. Bunları `data/setup.json` dosyasında `sso_cookies` dizisi altına ekleyin:
+
+#### Adım 5: setup.json oluşturun
+
+Adım 3'teki JSON ile `data/setup.json` dosyası oluşturun. Adım 4'te SSO cookie'leri yakaladıysanız, `sso_cookies` dizisine ekleyin:
+
+**SSO cookie'leri olmadan (24 saatte bir setup tekrar gerekir):**
+
+```json
+{"oid":"sizin-oid","tenant":"sizin-tenant","refresh_token":"sizin-refresh-token"}
+```
+
+**SSO cookie'leri ile (otomatik yenileme, önerilir):**
 
 ```json
 {
@@ -262,41 +212,51 @@ SSO cookie'leri, 24 saatlik refresh token süresi dolduktan sonra otomatik token
   "tenant": "sizin-tenant",
   "refresh_token": "sizin-refresh-token",
   "sso_cookies": [
-    {"name": "ESTSAUTH", "value": "cookie-degeri-buraya"},
-    {"name": "ESTSAUTHPERSISTENT", "value": "cookie-degeri-buraya"}
+    {"name": "ESTSAUTH", "value": "estsauth-degerini-buraya-yapistirin"},
+    {"name": "ESTSAUTHPERSISTENT", "value": "estsauthpersistent-degerini-buraya-yapistirin"}
   ]
 }
 ```
 
-4. SSO cookie'lerini kaydetmek için kurulum sihirbazını tekrar çalıştırın:
+#### Adım 6: Kurulum sihirbazını çalıştırın
+
+Kimlik bilgilerinizi şifreleyip kaydetmek için container içinde kurulum sihirbazını çalıştırın:
 
 ```bash
-./bin/m365-bridge setup-wizard
+docker exec -it m365bridge ./bin/m365-bridge setup-wizard
 ```
 
-Sihirbaz, SSO cookie'lerini AES-256-GCM ile şifreler ve `data/tokens/sso_cookies.json` dosyasında saklar. Refresh token süresi dolduğunda, sunucu otomatik olarak SSO cookie'lerini kullanarak `oauth2/v2.0/authorize?prompt=none` ile sessizce yeniden kimlik doğrular ve taze access ve refresh token elde eder.
+Sihirbaz şunları yapar:
+- `data/setup.json` dosyasını okur
+- Refresh token ve SSO cookie'lerini AES-256-GCM ile şifreler
+- Ortam değişkenlerini `data/.env` dosyasına kaydeder
+- Token'ı access token ile değiştirerek doğrular
 
-### Ortam Değişkenleri
+Başarı durumunda sunucu hazırdır. API `http://localhost:8230` adresinde kullanılabilir.
 
-| Değişken         | Zorunlu | Açıklama                                                                                 |
-|------------------|---------|------------------------------------------------------------------------------------------|
-| `M365_TENANT_ID` | Evet    | Azure AD tenant ID                                                                       |
-| `M365_USER_OID`  | Evet    | Kullanıcı object ID                                                                      |
-| `M365_CLIENT_ID` | Hayır   | Azure AD uygulama client ID (varsayılan: M365 Copilot web app client ID)                 |
-| `M365_API_KEYS`  | Hayır   | Proxy kimlik doğrulaması için virgülle ayrılmış API anahtarları (tekliye göre öncelikli) |
-| `M365_API_KEY`   | Hayır   | Proxy kimlik doğrulaması için tek API anahtarı (geriye uyumlu)                           |
+> **Not:** SSO cookie'leri yakalamadıysanız, refresh token 24 saat sonra süresi dolar ve sunucu çalışmayı durdurur. Yeni token almak için Adım 3, 5 ve 6'yı tekrarlayın. SSO cookie'leri ile sunucu, token süresi dolduğunda otomatik olarak yeniler.
 
-`M365_API_KEYS` veya `M365_API_KEY` ayarlandığında, tüm `/v1/*` uç noktaları `Authorization: Bearer <key>` başlığı gerektirir. İkisi de boş olduğunda kimlik doğrulama uygulanmaz.
+#### Alternatif: docker run
 
-Kurulum sihirbazı `data/.env` dosyasını otomatik oluşturur. Manuel oluşturmanız gerekirse beklenen format:
+Docker Compose yerine `docker run` kullanmayı tercih ederseniz:
 
-```env
-M365_TENANT_ID=your-tenant-id
-M365_USER_OID=your-user-oid
-M365_API_KEYS=key1,key2
+```bash
+docker run -d \
+  --name m365bridge \
+  -p 8230:8000 \
+  -v $(pwd)/data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/kilimcininkoroglu/m365bridge:latest
 ```
 
-`M365_CLIENT_ID` varsayılan olarak M365 Copilot web app'in kayıtlı client ID'sini kullanır. Yalnızca özel bir Azure AD uygulama kaydı kullanıyorsanız geçersiz kılmanız gerekir.
+Sonra yukarıdaki Adım 3-6'yı izleyin.
+
+#### Notlar
+
+- `data/` dizini token'ları, önbelleği ve yapılandırmayı saklar. İlk çalıştırmada otomatik oluşturulur.
+- Port `8230` (host) ile `8000` (container) arasında eşleştirilir. Host portunu `docker-compose.yml` veya `-p` parametresinden değiştirebilirsiniz.
+- Container varsayılan olarak `serve --port 8000` ile başlar.
+- Hazır imaj yerine kendiniz derlemek isterseniz: `docker compose up --build -d`
 
 ## Kullanım
 

@@ -181,6 +181,9 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 		return "", fmt.Errorf("%w: failed to create authorize request: %v", ErrRefreshFailed, err)
 	}
 	authReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	authReq.Header.Set("Origin", "https://m365.cloud.microsoft")
+	authReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	authReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	authResp, err := client.Do(authReq)
 	if err != nil {
@@ -240,7 +243,12 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 	}
 	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	tokenReq.Header.Set("Origin", "https://m365.cloud.microsoft")
-	tokenReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	tokenReq.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	tokenReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+	tokenReq.Header.Set("Accept", "application/json")
+	tokenReq.Header.Set("Sec-Fetch-Site", "cross-site")
+	tokenReq.Header.Set("Sec-Fetch-Mode", "cors")
+	tokenReq.Header.Set("Sec-Fetch-Dest", "empty")
 
 	tokenResp, err := client.Do(tokenReq)
 	if err != nil {

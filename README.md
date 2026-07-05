@@ -67,9 +67,9 @@ chmod +x m365-bridge-linux-amd64
 
 The easiest way to run M365Bridge is with Docker. The pre-built image is available on GitHub Container Registry.
 
-**Option 1: Docker Compose (recommended)**
+#### Step 1: Create docker-compose.yml
 
-Create a `docker-compose.yml` file:
+Create a `docker-compose.yml` file in your project directory:
 
 ```yaml
 services:
@@ -83,7 +83,7 @@ services:
     restart: unless-stopped
 ```
 
-Start the server:
+#### Step 2: Start the container
 
 ```bash
 docker compose up -d
@@ -91,59 +91,13 @@ docker compose up -d
 
 The API will be available at `http://localhost:8230`.
 
-**Option 2: Docker run**
+#### Step 3: Get your authentication token from the browser
 
-```bash
-docker run -d \
-  --name m365bridge \
-  -p 8230:8000 \
-  -v $(pwd)/data:/app/data \
-  --restart unless-stopped \
-  ghcr.io/kilimcininkoroglu/m365bridge:latest
-```
+The server needs a refresh token from your Microsoft 365 Copilot session. Extract it as follows:
 
-**Option 3: Build from source**
-
-If you want to build the image yourself instead of using the pre-built one:
-
-```bash
-docker compose up --build -d
-```
-
-**Notes:**
-
-- The `data/` directory stores tokens, cache, and configuration. It is created automatically on first run.
-- Port `8230` (host) maps to port `8000` (container). Change the host port in `docker-compose.yml` or the `-p` flag if needed.
-- The container starts with `serve --port 8000` by default.
-- After starting the container, run the setup wizard to configure authentication: `docker exec -it m365bridge ./bin/m365-bridge setup-wizard`
-
-## Configuration
-
-Run the setup wizard to configure authentication:
-
-```bash
-./bin/m365-bridge setup-wizard
-```
-
-The wizard will guide you through:
-1. Logging into https://m365.cloud.microsoft in your browser
-2. Running a JavaScript snippet in the browser console to intercept the refresh token
-3. Saving the JSON output to `data/setup.json`
-4. Encrypting and storing the refresh token
-5. Saving environment variables to `data/.env` file
-6. (Optional) Capturing SSO cookies for automatic token renewal after 24-hour expiry
-
-The wizard reads a JSON file (default: `data/setup.json`) containing `oid`, `tenant`, and `refresh_token` fields. It encrypts the refresh token with AES-256-GCM, stores the encryption key in `data/tokens/encryption.key`, and writes environment variables to `data/.env`.
-
-> **Note on token expiry:** Microsoft SPA refresh tokens expire after 24 hours (AADSTS700084). Without SSO cookies, you must re-run the setup wizard daily. To enable automatic renewal, capture SSO cookies during setup (see Step 2 below). SSO cookies last weeks/months and allow the server to silently re-authenticate when the refresh token expires.
-
-### Manual Setup
-
-If you prefer to extract the configuration manually instead of using the wizard:
-
-1. Open https://m365.cloud.microsoft and log in
-2. Press F12 to open DevTools, go to Console
-3. Paste and run the JavaScript snippet below. It intercepts MSAL token refresh requests to capture the plaintext refresh token (MSAL.js v3 encrypts refresh tokens in localStorage, so direct localStorage extraction does not work). It also clears cached access tokens to force a token refresh, which triggers the interceptor.
+1. Open [https://m365.cloud.microsoft](https://m365.cloud.microsoft) in your browser and log in
+2. Press **F12** to open DevTools, go to **Console**
+3. Paste and run the following JavaScript code:
 
 <details>
 <summary>Click to expand the JavaScript interceptor snippet</summary>
@@ -164,15 +118,8 @@ window.fetch = async function(...args) {
       const clone = resp.clone();
       const data = await clone.json();
       if (data.refresh_token) {
-        const cookies = document.cookie.split(';').map(c => {
-          const [name, ...rest] = c.trim().split('=');
-          return {name, value: rest.join('=')};
-        }).filter(c => c.name && c.value);
         console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
-        console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
-        console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
-        console.log('Then add them to the sso_cookies array in your setup.json manually.');
+        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
       }
     } catch(e) {}
   }
@@ -191,15 +138,8 @@ XMLHttpRequest.prototype.send = function(body) {
       try {
         const data = JSON.parse(this.responseText);
         if (data.refresh_token) {
-          const cookies = document.cookie.split(';').map(c => {
-            const [name, ...rest] = c.trim().split('=');
-            return {name, value: rest.join('=')};
-          }).filter(c => c.name && c.value);
           console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
-          console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
-          console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
-          console.log('Then add them to the sso_cookies array in your setup.json manually.');
+          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
         }
       } catch(e) {}
     }
@@ -236,25 +176,35 @@ return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL s
 </details>
 
 4. Watch the console for: `===== COPY THE COMPLETE JSON LINE BELOW =====`
-5. Copy the JSON output (it contains `oid`, `tenant`, `refresh_token`, and `sso_cookies`)
-6. Save it to `data/setup.json`
-7. Run the wizard to verify and save the configuration:
+5. Copy the JSON output. It looks like this:
 
-```bash
-./bin/m365-bridge setup-wizard
+```json
+{"oid":"your-oid","tenant":"your-tenant","refresh_token":"your-refresh-token"}
 ```
 
-The wizard will encrypt the refresh token with AES-256-GCM and save environment variables to `data/.env`.
+#### Step 4 (Optional): Get SSO cookies for automatic renewal
 
-### Capturing SSO Cookies (Optional, Recommended)
+Microsoft SPA refresh tokens expire after **24 hours**. Without SSO cookies, you must repeat Step 3 every 24 hours. SSO cookies enable automatic renewal and last weeks/months.
 
-SSO cookies enable automatic token renewal after the 24-hour refresh token expiry. Without them, you must re-run the setup wizard every 24 hours.
+To capture SSO cookies:
 
-1. In your browser DevTools, go to **Application** > **Cookies** > `https://login.microsoftonline.com`
-2. Find and copy the values of these cookies:
+1. Open [https://login.microsoftonline.com](https://login.microsoftonline.com) in your browser (this is where the cookies live, not m365.cloud.microsoft)
+2. Press **F12** to open DevTools, go to **Application** > **Cookies** > `https://login.microsoftonline.com`
+3. Find and copy the values of these two cookies:
    - `ESTSAUTH`
    - `ESTSAUTHPERSISTENT`
-3. Add them to `data/setup.json` under the `sso_cookies` array:
+
+#### Step 5: Create setup.json
+
+Create a file at `data/setup.json` with the JSON from Step 3. If you captured SSO cookies in Step 4, add them to the `sso_cookies` array:
+
+**Without SSO cookies (must re-run setup every 24 hours):**
+
+```json
+{"oid":"your-oid","tenant":"your-tenant","refresh_token":"your-refresh-token"}
+```
+
+**With SSO cookies (automatic renewal, recommended):**
 
 ```json
 {
@@ -262,41 +212,51 @@ SSO cookies enable automatic token renewal after the 24-hour refresh token expir
   "tenant": "your-tenant",
   "refresh_token": "your-refresh-token",
   "sso_cookies": [
-    {"name": "ESTSAUTH", "value": "cookie-value-here"},
-    {"name": "ESTSAUTHPERSISTENT", "value": "cookie-value-here"}
+    {"name": "ESTSAUTH", "value": "paste-estsauth-value-here"},
+    {"name": "ESTSAUTHPERSISTENT", "value": "paste-estsauthpersistent-value-here"}
   ]
 }
 ```
 
-4. Run the setup wizard again to save the SSO cookies:
+#### Step 6: Run the setup wizard
+
+Run the setup wizard inside the container to encrypt and save your credentials:
 
 ```bash
-./bin/m365-bridge setup-wizard
+docker exec -it m365bridge ./bin/m365-bridge setup-wizard
 ```
 
-The wizard will encrypt the SSO cookies with AES-256-GCM and store them in `data/tokens/sso_cookies.json`. When the refresh token expires, the server automatically uses the SSO cookies to silently re-authenticate via `oauth2/v2.0/authorize?prompt=none` and obtain a fresh access and refresh token.
+The wizard will:
+- Read `data/setup.json`
+- Encrypt the refresh token and SSO cookies with AES-256-GCM
+- Save environment variables to `data/.env`
+- Verify the token by exchanging it for an access token
 
-### Environment Variables
+On success, the server is ready. The API is available at `http://localhost:8230`.
 
-| Variable         | Required | Description                                                              |
-|------------------|----------|--------------------------------------------------------------------------|
-| `M365_TENANT_ID` | Yes      | Azure AD tenant ID                                                       |
-| `M365_USER_OID`  | Yes      | User object ID                                                           |
-| `M365_CLIENT_ID` | No       | Azure AD app client ID (defaults to the M365 Copilot web app client ID)  |
-| `M365_API_KEYS`  | No       | Comma-separated API keys for proxy auth (takes precedence over singular) |
-| `M365_API_KEY`   | No       | Single API key for proxy auth (backward compatible)                      |
+> **Note:** If you did not capture SSO cookies, the refresh token will expire after 24 hours and the server will stop working. Re-run Steps 3, 5, and 6 to get a new token. With SSO cookies, the server automatically renews tokens when they expire.
 
-When `M365_API_KEYS` or `M365_API_KEY` is set, all `/v1/*` endpoints require `Authorization: Bearer <key>` header. When both are empty, no auth is enforced.
+#### Alternative: docker run
 
-The setup wizard creates `data/.env` automatically. If you need to create it manually, here is the expected format:
+If you prefer `docker run` instead of Docker Compose:
 
-```env
-M365_TENANT_ID=your-tenant-id
-M365_USER_OID=your-user-oid
-M365_API_KEYS=key1,key2
+```bash
+docker run -d \
+  --name m365bridge \
+  -p 8230:8000 \
+  -v $(pwd)/data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/kilimcininkoroglu/m365bridge:latest
 ```
 
-`M365_CLIENT_ID` defaults to the M365 Copilot web app's registered client ID. You only need to override this if you are using a custom Azure AD app registration.
+Then follow Steps 3-6 above.
+
+#### Notes
+
+- The `data/` directory stores tokens, cache, and configuration. It is created automatically on first run.
+- Port `8230` (host) maps to port `8000` (container). Change the host port in `docker-compose.yml` or the `-p` flag if needed.
+- The container starts with `serve --port 8000` by default.
+- To build the image from source instead of using the pre-built one: `docker compose up --build -d`
 
 ## Usage
 

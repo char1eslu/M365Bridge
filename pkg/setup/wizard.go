@@ -49,18 +49,18 @@ func Run(filePath string) error {
 		return fmt.Errorf("%w\n\nSave the browser console JSON output to %s and try again", err, filePath)
 	}
 
-	// Step 2: Verify token
-	if err := verifyToken(tenant, oid, refreshToken); err != nil {
-		return err
-	}
-
-	// Step 3: Save SSO cookies if provided
+	// Step 2: Save SSO cookies if provided (before verify, so SSO fallback works)
 	if len(ssoCookies) > 0 {
 		if err := auth.SaveSSOCookies(ssoCookies); err != nil {
 			fmt.Printf("  Warning: failed to save SSO cookies: %v\n", err)
 		} else {
 			fmt.Println("  SSO cookies encrypted and saved")
 		}
+	}
+
+	// Step 3: Verify token (will fall back to SSO re-auth if refresh token expired)
+	if err := verifyToken(tenant, oid, refreshToken); err != nil {
+		return err
 	}
 
 	// Step 4: Save environment configuration
@@ -115,15 +115,8 @@ window.fetch = async function(...args) {
       const clone = resp.clone();
       const data = await clone.json();
       if (data.refresh_token) {
-        const cookies = document.cookie.split(';').map(c => {
-          const [name, ...rest] = c.trim().split('=');
-          return {name, value: rest.join('=')};
-        }).filter(c => c.name && c.value);
         console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
-        console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
-        console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
-        console.log('Then add them to the sso_cookies array in your setup.json manually.');
+        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
       }
     } catch(e) {}
   }
@@ -142,15 +135,8 @@ XMLHttpRequest.prototype.send = function(body) {
       try {
         const data = JSON.parse(this.responseText);
         if (data.refresh_token) {
-          const cookies = document.cookie.split(';').map(c => {
-            const [name, ...rest] = c.trim().split('=');
-            return {name, value: rest.join('=')};
-          }).filter(c => c.name && c.value);
           console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token, sso_cookies: cookies}));
-          console.log('NOTE: HttpOnly cookies (ESTSAUTH, ESTSAUTHPERSISTENT) are NOT accessible via JS.');
-          console.log('To capture them, go to DevTools > Application > Cookies > https://login.microsoftonline.com');
-          console.log('Then add them to the sso_cookies array in your setup.json manually.');
+          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
         }
       } catch(e) {}
     }
@@ -205,12 +191,12 @@ return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL s
 	fmt.Println("  24-hour refresh token expiry, without running setup-wizard again.")
 	fmt.Println("  SSO cookies last weeks/months.")
 	fmt.Println()
-	fmt.Println("  In DevTools:")
-	fmt.Println("    1. Go to Application -> Cookies -> https://login.microsoftonline.com")
+	fmt.Println("  SSO cookies are on login.microsoftonline.com, NOT m365.cloud.microsoft.")
+	fmt.Println("  Open https://login.microsoftonline.com in your browser first, then:")
+	fmt.Println("    1. Press F12, go to Application -> Cookies -> https://login.microsoftonline.com")
 	fmt.Println("    2. Find these cookies and copy their values:")
 	fmt.Println("       - ESTSAUTH")
 	fmt.Println("       - ESTSAUTHPERSISTENT")
-	fmt.Println("       -SignInStateCookie (if present)")
 	fmt.Println("    3. Add them to data/setup.json under \"sso_cookies\" array:")
 	fmt.Println()
 	fmt.Println("  Example setup.json with SSO cookies:")
@@ -289,7 +275,7 @@ func getConfigFromFile(path string) (string, string, string, []auth.SSOCookie, e
 // verifyToken validates the refresh token by exchanging it for an access token.
 func verifyToken(tenant, oid, refreshToken string) error {
 	fmt.Println(strings.Repeat("=", 60))
-	fmt.Println("  Step 2: Verify Token")
+	fmt.Println("  Step 3: Verify Token")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println()
 

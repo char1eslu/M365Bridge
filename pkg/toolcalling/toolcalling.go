@@ -50,8 +50,7 @@ func nextToolCallID() string {
 	return fmt.Sprintf("call_%d", toolCallIDCounter)
 }
 
-// toolCallPattern matches JSON blocks wrapped in angle-bracket tool tags.
-// The tag name is "tool" and the content is a JSON object with name and arguments.
+// toolCallPattern matches JSON blocks wrapped in <tool>...</tool> tags.
 var toolCallPattern = regexp.MustCompile(`(?s)<tool>\s*(\{.*?\})\s*</tool>`)
 
 // InjectTools prepends tool definitions and instructions to the last user message.
@@ -74,38 +73,56 @@ func InjectTools(messages []string, tools []ToolDef) []string {
 	return result
 }
 
-// buildToolInstruction creates the system prompt that tells the model about available tools
-// and the format to use when calling them. The prompt is deliberately forceful to override
-// the M365 backend's tendency to use its own built-in tools (code_interpreter, search)
-// instead of the client-defined tools.
+// buildToolInstruction creates the system prompt that tells the model about client-side
+// tools and the format to use when requesting the client to execute them.
+//
+// The prompt uses "coordinator/delegation" framing: the model has NO filesystem access
+// and CANNOT execute these tools itself. The tools run on the CLIENT side. The model
+// must REQUEST the client to perform actions by emitting <tool> blocks.
+//
+// This framing is critical because M365 Copilot has its own server-side tools
+// (code_interpreter, search). Without explicitly telling the model "you CANNOT do
+// this yourself, REQUEST the client", the backend routes file operations to its own
+// code_interpreter sandbox instead of emitting a tool call for the client.
 func buildToolInstruction(tools []ToolDef) string {
 	var sb strings.Builder
 
-	sb.WriteString("=== MANDATORY TOOL USE PROTOCOL ===\n")
-	sb.WriteString("You are operating as a tool-calling assistant. The tools listed below are the ONLY tools you may use. ")
-	sb.WriteString("You do NOT have access to code_interpreter, web search, or any other built-in tools for this request. ")
-	sb.WriteString("Do NOT attempt to use code_interpreter, search, or any tool not listed below. ")
-	sb.WriteString("Do NOT say that a tool is unavailable or not in your environment. The tools below ARE available to you.\n\n")
+	sb.WriteString("=== CLIENT-SIDE TOOL USE PROTOCOL ===\n\n")
 
-	sb.WriteString("When the user's request requires using a tool, you MUST respond with a tool call. ")
-	sb.WriteString("A tool call is a JSON object wrapped in angle-bracket tool tags, like this:\n")
+	sb.WriteString("IMPORTANT: You are acting as a coordinator. You do NOT have direct access to a filesystem, ")
+	sb.WriteString("code execution environment, or any of the tools listed below. These tools are executed by ")
+	sb.WriteString("the CLIENT (the application on the user's computer). Your role is to REQUEST the client to ")
+	sb.WriteString("perform actions on your behalf.\n\n")
+
+	sb.WriteString("You CANNOT read files, write files, or list directories yourself. ")
+	sb.WriteString("You do NOT have access to code_interpreter or any sandbox for these operations. ")
+	sb.WriteString("When you need to perform an action that requires a tool, you must REQUEST it from the client.\n\n")
+
+	sb.WriteString("=== HOW TO REQUEST A TOOL ===\n\n")
+	sb.WriteString("To request the client to execute a tool, output a tool request block in this exact format:\n")
 	sb.WriteString("<tool>{\"name\":\"tool_name\",\"arguments\":{\"key\":\"value\"}}</tool>\n\n")
 
-	sb.WriteString("CRITICAL RULES:\n")
-	sb.WriteString("1. When a tool is needed, output the tool call block. Do NOT use markdown code fences around it.\n")
-	sb.WriteString("2. The tool call MUST be wrapped in <tool> and </tool> tags.\n")
-	sb.WriteString("3. The JSON inside must have \"name\" and \"arguments\" fields. Arguments must be a JSON object.\n")
-	sb.WriteString("4. Do NOT use your built-in code_interpreter or search tools. Use ONLY the tools listed below.\n")
-	sb.WriteString("5. If the user asks you to read/write a file, list a directory, or perform any action that matches a tool below, you MUST call that tool.\n")
-	sb.WriteString("6. Do NOT refuse by saying the tool is unavailable. It IS available. Call it.\n")
-	sb.WriteString("7. You may include a brief explanation before the tool call block, but the tool call block MUST be present.\n\n")
+	sb.WriteString("The client will:\n")
+	sb.WriteString("1. Parse your tool request\n")
+	sb.WriteString("2. Execute the tool on the user's machine\n")
+	sb.WriteString("3. Send you the result in the next message\n\n")
 
-	sb.WriteString("EXAMPLE:\n")
-	sb.WriteString("User: Create a file called test.txt with content \"hello\"\n")
-	sb.WriteString("Your response: I'll create that file for you.\n")
-	sb.WriteString("<tool>{\"name\":\"write_file\",\"arguments\":{\"path\":\"test.txt\",\"content\":\"hello\"}}</tool>\n\n")
+	sb.WriteString("=== RULES ===\n\n")
+	sb.WriteString("1. When the user's request requires reading/writing files or listing directories, you MUST emit a <tool> block to request the client to do it.\n")
+	sb.WriteString("2. Do NOT attempt to use code_interpreter, search, or any of your built-in tools for file operations. You CANNOT access the filesystem.\n")
+	sb.WriteString("3. Do NOT say \"I don't have access to this tool\" or \"this tool is not available\". The tools below ARE available — on the CLIENT side. Request them.\n")
+	sb.WriteString("4. Do NOT try to simulate or approximate the tool result yourself. Request the tool and wait for the client's response.\n")
+	sb.WriteString("5. The tool request MUST be wrapped in <tool> and </tool> tags. Do NOT use markdown code fences.\n")
+	sb.WriteString("6. The JSON inside must have \"name\" and \"arguments\" fields. Arguments must be a JSON object matching the tool's parameters.\n")
+	sb.WriteString("7. You may include a brief explanation before the tool request block.\n")
+	sb.WriteString("8. Emit only ONE tool request per response. Wait for the client's result before continuing.\n\n")
 
-	sb.WriteString("=== AVAILABLE TOOLS ===\n")
+	sb.WriteString("=== EXAMPLE ===\n\n")
+	sb.WriteString("User: Read the file /home/user/config.json\n")
+	sb.WriteString("Assistant: I'll request the client to read that file for me.\n")
+	sb.WriteString("<tool>{\"name\":\"read_file\",\"arguments\":{\"path\":\"/home/user/config.json\"}}</tool>\n\n")
+
+	sb.WriteString("=== AVAILABLE CLIENT-SIDE TOOLS ===\n\n")
 
 	for _, tool := range tools {
 		name := tool.Function.Name
@@ -135,8 +152,9 @@ func buildToolInstruction(tools []ToolDef) string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("=== END TOOL DEFINITIONS ===\n")
-	sb.WriteString("Remember: When a tool is needed, respond with the <tool>...</tool> block. Do NOT use code_interpreter or search. Do NOT refuse.\n")
+	sb.WriteString("=== END TOOL DEFINITIONS ===\n\n")
+	sb.WriteString("Remember: You CANNOT execute these tools yourself. REQUEST the client by emitting a <tool> block. ")
+	sb.WriteString("Do NOT use code_interpreter or search for file operations. Do NOT refuse.\n")
 
 	return sb.String()
 }

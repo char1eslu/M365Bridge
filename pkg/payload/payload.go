@@ -79,6 +79,7 @@ type Message struct {
 	Name        string             `json:"name,omitempty"`
 	Images      []ImageData        `json:"-"`
 	Annotations []MessageAnnotation `json:"-"`
+	ToolCallID  string             `json:"tool_call_id,omitempty"` // OpenAI tool role messages
 }
 
 // ImageData represents an image extracted from multimodal content.
@@ -97,19 +98,45 @@ type MessageAnnotation struct {
 
 // UnmarshalJSON implements custom JSON unmarshaling for Message to handle
 // both string content and multimodal content arrays (OpenAI/Anthropic format).
+// It also converts tool-related messages (tool role, tool_calls, tool_result,
+// tool_use blocks) into plain text so the M365 backend can process them.
 func (m *Message) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-		Name    string          `json:"name,omitempty"`
+		Role       string          `json:"role"`
+		Content    json.RawMessage `json:"content"`
+		Name       string          `json:"name,omitempty"`
+		ToolCallID string          `json:"tool_call_id,omitempty"`
+		ToolCalls  []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
+		} `json:"tool_calls,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	m.Role = raw.Role
 	m.Name = raw.Name
+	m.ToolCallID = raw.ToolCallID
+
+	// Handle OpenAI assistant messages with tool_calls field
+	if len(raw.ToolCalls) > 0 {
+		var sb strings.Builder
+		for _, tc := range raw.ToolCalls {
+			sb.WriteString(fmt.Sprintf("[Previous Tool Call: %s]\nArguments: %s\n\n", tc.Function.Name, tc.Function.Arguments))
+		}
+		m.Content = strings.TrimSpace(sb.String())
+	}
 
 	if len(raw.Content) == 0 {
+		return nil
+	}
+
+	// Handle null content (e.g. assistant message with tool_calls and content=null)
+	if string(raw.Content) == "null" {
 		return nil
 	}
 
@@ -117,6 +144,10 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(raw.Content, &s); err == nil {
 		m.Content = s
+		// Convert tool role messages to formatted text
+		if m.Role == "tool" && m.ToolCallID != "" {
+			m.Content = fmt.Sprintf("[Tool Result (call_id: %s)]\n%s", m.ToolCallID, s)
+		}
 		return nil
 	}
 
@@ -157,6 +188,29 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 					}
 				}
 			}
+		case "tool_use":
+			// Anthropic assistant message: previous tool call
+			name, _ := block["name"].(string)
+			input, _ := block["input"]
+			if inputBytes, err := json.Marshal(input); err == nil {
+				m.Content += fmt.Sprintf("\n[Previous Tool Call: %s]\nArguments: %s\n", name, string(inputBytes))
+			}
+		case "tool_result":
+			// Anthropic user message: tool result
+			toolUseID, _ := block["tool_use_id"].(string)
+			resultContent := ""
+			if c, ok := block["content"].(string); ok {
+				resultContent = c
+			} else if cArr, ok := block["content"].([]interface{}); ok {
+				for _, cItem := range cArr {
+					if cMap, ok := cItem.(map[string]interface{}); ok {
+						if txt, ok := cMap["text"].(string); ok {
+							resultContent += txt
+						}
+					}
+				}
+			}
+			m.Content += fmt.Sprintf("\n[Tool Result (call_id: %s)]\n%s\n", toolUseID, resultContent)
 		}
 	}
 

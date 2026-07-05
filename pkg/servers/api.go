@@ -20,6 +20,7 @@ import (
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
 	"github.com/pkoukk/tiktoken-go"
 )
 
@@ -404,6 +405,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		ResponseFormat map[string]interface{}   `json:"response_format"`
 		SessionID      string                   `json:"session_id"`
 		User           string                   `json:"user"`
+		Tools          []toolcalling.ToolDef    `json:"tools"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -422,6 +424,11 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 		if format, ok := req.ResponseFormat["type"].(string); ok && format == "json_object" {
 			api.injectJSONMode(&req.Messages)
 		}
+	}
+
+	// Inject tool definitions into last user message if tool calling is enabled
+	if api.config.ToolCalling && len(req.Tools) > 0 {
+		injectToolDefs(&req.Messages, req.Tools)
 	}
 
 	// Resolve session ID and conversation ID
@@ -517,6 +524,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 		MaxTokens   int               `json:"max_tokens"`
 		Stream      bool              `json:"stream"`
 		Temperature float64           `json:"temperature"`
+		Tools       []toolcalling.ToolDef `json:"tools"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -533,6 +541,11 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: req.System})
 	}
 	chatMessages = append(chatMessages, req.Messages...)
+
+	// Inject tool definitions into last user message if tool calling is enabled
+	if api.config.ToolCalling && len(req.Tools) > 0 {
+		injectToolDefs(&chatMessages, req.Tools)
+	}
 
 	// Resolve session ID and conversation ID
 	sid := api.getSessionID(r, nil)
@@ -649,6 +662,10 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	thinkingText := ""
 	truncated := false
 
+	// When tool calling is enabled, buffer all text and parse for tool calls at the end.
+	// Tool call blocks may span multiple chunks, so we can't parse incrementally.
+	toolCallingEnabled := api.config.ToolCalling
+
 	for chunk := range ch {
 		if chunk.Error != nil {
 			api.sendSSEError(w, chunkID, openaiModel, chunk.Error)
@@ -688,25 +705,62 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 
 		fullText += chunk.Text
 
+		// If tool calling is not enabled, stream text directly
+		if !toolCallingEnabled {
+			if !hasContent {
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+					"role":    "assistant",
+					"content": chunk.Text,
+				})
+				hasContent = true
+			} else {
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+					"content": chunk.Text,
+				})
+			}
+			flusher.Flush()
+		}
+	}
+
+	// Parse simulated tool calls from full text if tool calling is enabled
+	var simToolCalls []toolcalling.ToolCall
+	if toolCallingEnabled {
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText)
+		if len(parsedCalls) > 0 {
+			fullText = cleanedText
+			simToolCalls = parsedCalls
+		}
+	}
+
+	// If tool calling buffered text, send it now as a single chunk
+	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
 		if !hasContent {
 			api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
 				"role":    "assistant",
-				"content": chunk.Text,
+				"content": fullText,
 			})
 			hasContent = true
 		} else {
 			api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
-				"content": chunk.Text,
+				"content": fullText,
 			})
 		}
-
 		flusher.Flush()
 	}
 
-	// Send tool calls in stream if any
+	// Send tool calls in stream if any (from M365 backend or simulated)
 	api.mu.RLock()
 	toolCalls := api.m365Client.LastToolCalls()
 	api.mu.RUnlock()
+
+	// Append simulated tool calls
+	for _, stc := range simToolCalls {
+		toolCalls = append(toolCalls, client.ToolCall{
+			ID:       stc.ID,
+			Type:     "function",
+			Function: client.ToolCallFunction{Name: stc.Name, Arguments: string(stc.Arguments)},
+		})
+	}
 
 	if len(toolCalls) > 0 {
 		if !hasContent {
@@ -739,6 +793,9 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	if truncated {
 		finishReason = "length"
 	}
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
 	promptTok := countTokens(promptStr)
 	completionTok := countTokens(fullText)
 	reasoningTok := countTokens(thinkingText)
@@ -766,6 +823,22 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
+	}
+
+	// Parse simulated tool calls from response text if tool calling is enabled
+	if api.config.ToolCalling {
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText)
+		if len(parsedCalls) > 0 {
+			respText = cleanedText
+			finishReason = "tool_calls"
+			for _, pc := range parsedCalls {
+				toolCalls = append(toolCalls, client.ToolCall{
+					ID:       pc.ID,
+					Type:     "function",
+					Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+				})
+			}
+		}
 	}
 
 	// Enforce max_tokens on response text
@@ -799,7 +872,9 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 			}
 		}
 		msg["tool_calls"] = openaiToolCalls
-		msg["content"] = nil
+		if respText == "" {
+			msg["content"] = nil
+		}
 	}
 
 	promptStr := fmt.Sprint(messages)
@@ -878,6 +953,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	thinkingBlockOpen := false
 	textBlockOpen := false
 	blockIndex := 0
+	toolCallingEnabled := api.config.ToolCalling
 	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID)
 
 	for chunk := range ch {
@@ -927,8 +1003,8 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 			thinkingBlockOpen = false
 		}
 
-		// Open text block on first text chunk
-		if !textBlockOpen {
+		// Open text block on first text chunk (only if not buffering for tool calling)
+		if !textBlockOpen && !toolCallingEnabled {
 			cbStart := map[string]interface{}{
 				"type":          "content_block_start",
 				"index":         blockIndex,
@@ -947,10 +1023,42 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		}
 
 		fullText += chunk.Text
+
+		// If tool calling is not enabled, stream text deltas directly
+		if !toolCallingEnabled {
+			delta := map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": blockIndex,
+				"delta": map[string]interface{}{"type": "text_delta", "text": chunk.Text},
+			}
+			api.sendAnthropicSSE(w, "content_block_delta", delta)
+			flusher.Flush()
+		}
+	}
+
+	// Parse simulated tool calls from full text if tool calling is enabled
+	var simToolCalls []toolcalling.ToolCall
+	if toolCallingEnabled {
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(fullText)
+		if len(parsedCalls) > 0 {
+			fullText = cleanedText
+			simToolCalls = parsedCalls
+		}
+	}
+
+	// If tool calling buffered text, send it now as a text block
+	if toolCallingEnabled && fullText != "" {
+		cbStart := map[string]interface{}{
+			"type":          "content_block_start",
+			"index":         blockIndex,
+			"content_block": map[string]interface{}{"type": "text", "text": ""},
+		}
+		api.sendAnthropicSSE(w, "content_block_start", cbStart)
+		textBlockOpen = true
 		delta := map[string]interface{}{
 			"type":  "content_block_delta",
 			"index": blockIndex,
-			"delta": map[string]interface{}{"type": "text_delta", "text": chunk.Text},
+			"delta": map[string]interface{}{"type": "text_delta", "text": fullText},
 		}
 		api.sendAnthropicSSE(w, "content_block_delta", delta)
 		flusher.Flush()
@@ -963,12 +1071,54 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	}
 	if textBlockOpen {
 		api.sendAnthropicSSE(w, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": blockIndex})
+		blockIndex++
 	}
+
+	// Send tool_use content blocks if any (server-side tools from M365 backend or simulated)
+	api.mu.RLock()
+	toolCalls := api.m365Client.LastToolCalls()
+	api.mu.RUnlock()
+
+	// Append simulated tool calls
+	for _, stc := range simToolCalls {
+		toolCalls = append(toolCalls, client.ToolCall{
+			ID:       stc.ID,
+			Type:     "function",
+			Function: client.ToolCallFunction{Name: stc.Name, Arguments: string(stc.Arguments)},
+		})
+	}
+
+	for _, tc := range toolCalls {
+		var input interface{}
+		json.Unmarshal([]byte(tc.Function.Arguments), &input)
+		if input == nil {
+			input = map[string]interface{}{}
+		}
+		api.sendAnthropicSSE(w, "content_block_start", map[string]interface{}{
+			"type":  "content_block_start",
+			"index": blockIndex,
+			"content_block": map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": input,
+			},
+		})
+		api.sendAnthropicSSE(w, "content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": blockIndex,
+		})
+		blockIndex++
+	}
+	flusher.Flush()
 
 	// Send message_delta event
 	stopReason := "end_turn"
 	if truncated {
 		stopReason = "max_tokens"
+	}
+	if len(toolCalls) > 0 {
+		stopReason = "tool_use"
 	}
 	msgDelta := map[string]interface{}{
 		"type": "message_delta",
@@ -1005,6 +1155,22 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		return
 	}
 
+	// Parse simulated tool calls from response text if tool calling is enabled
+	if api.config.ToolCalling {
+		cleanedText, parsedCalls := toolcalling.ParseToolCalls(respText)
+		if len(parsedCalls) > 0 {
+			respText = cleanedText
+			finishReason = "tool_calls"
+			for _, pc := range parsedCalls {
+				toolCalls = append(toolCalls, client.ToolCall{
+					ID:       pc.ID,
+					Type:     "function",
+					Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+				})
+			}
+		}
+	}
+
 	stopReason := "end_turn"
 	if finishReason == "tool_calls" {
 		stopReason = "tool_use"
@@ -1022,12 +1188,17 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 	if thinking != "" {
 		content = append(content, map[string]interface{}{"type": "thinking", "thinking": thinking})
 	}
-	content = append(content, map[string]interface{}{"type": "text", "text": respText})
+	if respText != "" {
+		content = append(content, map[string]interface{}{"type": "text", "text": respText})
+	}
 
 	if len(toolCalls) > 0 {
 		for _, tc := range toolCalls {
 			var input interface{}
 			json.Unmarshal([]byte(tc.Function.Arguments), &input)
+			if input == nil {
+				input = map[string]interface{}{}
+			}
 			content = append(content, map[string]interface{}{
 				"type":  "tool_use",
 				"id":    tc.ID,
@@ -1386,6 +1557,27 @@ func (api *APIServer) injectJSONMode(messages *[]payload.Message) {
 	}
 
 	*messages = append([]payload.Message{{Role: "system", Content: instruction}}, *messages...)
+}
+
+// injectToolDefs prepends tool definitions and instructions to the last user message.
+func injectToolDefs(messages *[]payload.Message, tools []toolcalling.ToolDef) {
+	if len(tools) == 0 || len(*messages) == 0 {
+		return
+	}
+
+	// Build tool instruction text
+	msgTexts := make([]string, len(*messages))
+	for i, msg := range *messages {
+		msgTexts[i] = msg.Content
+	}
+	injected := toolcalling.InjectTools(msgTexts, tools)
+
+	for i := len(*messages) - 1; i >= 0; i-- {
+		if (*messages)[i].Role == "user" {
+			(*messages)[i].Content = injected[i]
+			break
+		}
+	}
 }
 
 // fimToChat converts FIM (fill-in-the-middle) prompts to chat format.

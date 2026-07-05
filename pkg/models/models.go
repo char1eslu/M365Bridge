@@ -21,55 +21,56 @@ const (
 
 // ModelConfig represents the configuration for a specific model variant.
 type ModelConfig struct {
-	Tone      string // The tone/style parameter sent to the backend
-	Override  string // Optional GPT model override identifier
-	OpenAIID  string // OpenAI-compatible model identifier
+	Tone     string // The tone/style parameter sent to the backend
+	Override string // Optional GPT model override identifier
+	OpenAIID string // OpenAI-compatible model identifier
 }
 
 // ModelRegistry maps model keys to their configurations.
 var ModelRegistry = map[string]ModelConfig{
 	"auto": {
-		Tone:      "Magic",
-		Override:  "",
-		OpenAIID:  "gpt-4-auto",
+		Tone:     "Magic",
+		Override: "",
+		OpenAIID: "gpt-4-auto",
 	},
 	"quick": {
-		Tone:      "Chat",
-		Override:  "",
-		OpenAIID:  "gpt-4-quick",
+		Tone:     "Chat",
+		Override: "",
+		OpenAIID: "gpt-4-quick",
 	},
 	"reasoning": {
-		Tone:      "Magic",
-		Override:  "",
-		OpenAIID:  "gpt-4-reasoning",
+		Tone:     "Magic",
+		Override: "",
+		OpenAIID: "gpt-4-reasoning",
 	},
 	"gpt5.5": {
-		Tone:      "Gpt_5_5_Chat",
-		Override:  "",
-		OpenAIID:  "gpt-5.5",
+		Tone:     "Gpt_5_5_Chat",
+		Override: "",
+		OpenAIID: "gpt-5.5",
 	},
 	"gpt5.5-reasoning": {
-		Tone:      "Gpt_5_5_Reasoning",
-		Override:  "",
-		OpenAIID:  "gpt-5.5-reasoning",
+		Tone:     "Gpt_5_5_Reasoning",
+		Override: "",
+		OpenAIID: "gpt-5.5-reasoning",
 	},
 }
 
 // ToolMessageType maps WebSocket message types to tool function names.
 var ToolMessageType = map[string]string{
 	"InternalSearchQuery": "search",
-	"GeneratedCode":        "code_interpreter",
-	"TriggerPlugin":        "trigger_plugin",
-	"InvokeAction":         "invoke_action",
+	"GeneratedCode":       "code_interpreter",
+	"TriggerPlugin":       "trigger_plugin",
+	"InvokeAction":        "invoke_action",
 }
 
 // Config holds environment-based configuration.
 type Config struct {
-	TenantID  string
-	UserOID   string
-	ClientID  string
-	Scope     string
-	APIKeys   []string
+	TenantID    string
+	UserOID     string
+	ClientID    string
+	Scope       string
+	APIKeys     []string
+	ToolCalling bool
 }
 
 // LoadConfig loads configuration from .env file and environment variables.
@@ -79,11 +80,12 @@ func LoadConfig() *Config {
 	loadDotEnv()
 
 	return &Config{
-		TenantID:  os.Getenv("M365_TENANT_ID"),
-		UserOID:   os.Getenv("M365_USER_OID"),
-		ClientID:  getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
-		Scope:     DefaultScope,
-		APIKeys:   parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
+		TenantID:    os.Getenv("M365_TENANT_ID"),
+		UserOID:     os.Getenv("M365_USER_OID"),
+		ClientID:    getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
+		Scope:       DefaultScope,
+		APIKeys:     parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
+		ToolCalling: getEnvBool("M365_TOOL_CALLING", true),
 	}
 }
 
@@ -161,4 +163,17 @@ func getEnvWithDefault(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// getEnvBool returns true for "true", "1", "yes", "on" (case-insensitive).
+func getEnvBool(key string, defaultValue bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch value {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return defaultValue
+	}
 }

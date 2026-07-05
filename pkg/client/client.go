@@ -510,6 +510,15 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 																ch <- ConversationStreamChunk{Thinking: t, IsFinal: false}
 															}
 														}
+														// Extract web search tool calls from searchQueries field
+														if sq, ok := msgMap["searchQueries"].([]interface{}); ok && len(sq) > 0 {
+															for _, q := range sq {
+																if query, ok := q.(string); ok && query != "" {
+																	tc := makeSearchToolCall(query, msgMap)
+																	toolCalls = append(toolCalls, *tc)
+																}
+															}
+														}
 													}
 												}
 											}
@@ -680,6 +689,27 @@ func extractToolCall(msg map[string]interface{}, funcName string) *ToolCall {
 // generateUUID generates a random UUID string.
 func generateUUID() string {
 	return uuid.New().String()
+}
+
+// makeSearchToolCall creates a ToolCall for a web search query extracted from
+// the searchQueries field of a Progress message.
+func makeSearchToolCall(query string, msg map[string]interface{}) *ToolCall {
+	argsMap := map[string]string{"query": query}
+	argsBytes, _ := json.Marshal(argsMap)
+
+	messageID, _ := msg["messageId"].(string)
+	if messageID == "" {
+		messageID = generateUUID()
+	}
+
+	return &ToolCall{
+		ID:   messageID,
+		Type: "function",
+		Function: ToolCallFunction{
+			Name:      "search",
+			Arguments: string(argsBytes),
+		},
+	}
 }
 
 // formatUUID converts a UUID string to standard UUID format (8-4-4-4-12).

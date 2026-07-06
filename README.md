@@ -27,6 +27,7 @@ Your App -> M365Bridge -> substrate.office.com (SignalR) -> M365 Copilot Backend
 - Multi-turn conversation support via ConversationId tracking
 - Session isolation (per-session M365 conversations)
 - Thinking/reasoning content extraction (`reasoning_content` for OpenAI, `thinking` blocks for Anthropic)
+- Simulated tool calling (client-defined tools work on both OpenAI and Anthropic endpoints, streaming and non-streaming)
 - OpenAI-compatible API endpoints
 - Anthropic-compatible API endpoints (dedicated SSE handlers)
 - API key authentication (`M365_API_KEYS` / `M365_API_KEY`)
@@ -436,15 +437,15 @@ print(resp.choices[0].message.content)
 
 ## Models
 
-All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models.
+All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models. All model identifiers route to the same GPT-5 backend; the `tone` field controls response behavior.
 
-| Key                | Tone              | OpenAI ID         |
-|--------------------|-------------------|-------------------|
-| `auto`             | Magic             | gpt-4-auto        |
-| `quick`            | Chat              | gpt-4-quick       |
-| `reasoning`        | Magic             | gpt-4-reasoning   |
-| `gpt5.5`           | Gpt_5_5_Chat      | gpt-5.5           |
-| `gpt5.5-reasoning` | Gpt_5_5_Reasoning | gpt-5.5-reasoning |
+| Key                | Tone              | OpenAI ID         | Thinking? |
+|--------------------|-------------------|-------------------|-----------|
+| `auto`             | Magic             | gpt-4-auto        | No        |
+| `quick`            | Chat              | gpt-4-quick       | No        |
+| `reasoning`        | Magic             | gpt-4-reasoning   | No        |
+| `gpt5.5`           | Gpt_5_5_Chat      | gpt-5.5           | No        |
+| `gpt5.5-reasoning` | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Yes       |
 
 ### Which model should I use?
 
@@ -456,7 +457,125 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | GPT-5.5 chat (latest conversational model)   | `gpt5.5`           |
 | GPT-5.5 with deep thinking (shows reasoning) | `gpt5.5-reasoning` |
 
-`gpt5.5-reasoning` produces `reasoning_content` output containing the model's thinking process. All model identifiers route to the same GPT-5 backend; the `tone` field controls response behavior.
+`gpt5.5-reasoning` produces `reasoning_content` output containing the model's thinking process. OpenAI endpoints expose this as `reasoning_content`; Anthropic endpoints expose it as a `thinking` content block before the `text` block.
+
+### Session ID in Model Name
+
+You can embed a session ID directly in the model name using the `:` separator. This is useful for clients (like Claude Code, Codex) that cannot send custom headers:
+
+```
+model: "gpt5.5-reasoning:my-session-001"
+```
+
+This is equivalent to setting `X-Session-Id: my-session-001` header or `session_id: "my-session-001"` in the request body. The model key is extracted before the `:` and the session ID is extracted after it.
+
+### External Model Names
+
+Clients that send model names not in the registry (e.g. `claude-sonnet-4-20250514`, `gpt-4o`, `o1`) will fall back to the `auto` model. The proxy accepts any model string — unknown names do not cause errors, they just use the default model.
+
+## Tool Calling
+
+M365Bridge supports **simulated tool calling** — client-defined tools (Claude Code's Read/Bash/Write, Codex tools, etc.) work without M365 backend natively supporting them.
+
+### How It Works
+
+1. Client sends a request with `tools` array (OpenAI function definitions or Anthropic tool schemas)
+2. M365Bridge embeds the entire request JSON into the prompt sent to M365 Copilot
+3. M365 Copilot returns a full response JSON in a ```` ```json ```` block
+4. M365Bridge parses the response and extracts tool calls into OpenAI `tool_calls` or Anthropic `tool_use` content blocks
+5. Client executes the tool and sends the result back in the next message
+
+This works on both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) endpoints, in both streaming and non-streaming modes.
+
+### Example (OpenAI)
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5-reasoning",
+    "messages": [{"role": "user", "content": "Run: echo hello"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Run a shell command",
+        "parameters": {
+          "type": "object",
+          "properties": {"command": {"type": "string"}},
+          "required": ["command"]
+        }
+      }
+    }],
+    "tool_choice": "required"
+  }'
+```
+
+Response:
+
+```json
+{
+  "choices": [{
+    "finish_reason": "tool_calls",
+    "message": {
+      "role": "assistant",
+      "tool_calls": [{
+        "id": "call_001",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\": \"echo hello\"}"
+        }
+      }]
+    }
+  }]
+}
+```
+
+### Example (Anthropic)
+
+```bash
+curl http://127.0.0.1:8000/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-key" \
+  -d '{
+    "model": "gpt5.5-reasoning",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Run: echo hello"}],
+    "tools": [{
+      "name": "bash",
+      "description": "Run a shell command",
+      "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"]
+      }
+    }],
+    "tool_choice": {"type": "any"}
+  }'
+```
+
+Response:
+
+```json
+{
+  "content": [{
+    "type": "tool_use",
+    "id": "toolu_001",
+    "name": "bash",
+    "input": {"command": "echo hello"}
+  }],
+  "stop_reason": "tool_use"
+}
+```
+
+### Notes
+
+- Tool calling is always enabled — no configuration needed. Requests without `tools` are unaffected.
+- When M365 Copilot runs its own server-side tools (web search, code interpreter) and returns plain text instead of a simulated JSON payload, the response is returned as a normal text completion with `finish_reason: "stop"`.
+- `tool_result` messages (OpenAI) and `tool_use`/`tool_result` content blocks (Anthropic) in conversation history are converted to plain text before being sent to M365, since the M365 backend does not understand tool roles.
+- Streaming endpoints buffer the full response before parsing tool calls (tool call JSON may span multiple chunks).
 
 ## Project Structure
 
@@ -484,7 +603,7 @@ data/                    # Runtime data (gitignored): tokens/, setup.json, cache
 | `github.com/google/uuid`        | UUID generation for SIDs and request IDs                              |
 | `github.com/gorilla/websocket`  | WebSocket client for SignalR                                          |
 | `github.com/pkoukk/tiktoken-go` | BPE token counting (cl100k_base) for usage and max_tokens enforcement |
-| `golang.org/x/net`             | publicsuffix list for SSO cookie jar                                |
+| `golang.org/x/net`              | publicsuffix list for SSO cookie jar                                  |
 
 ## Security
 

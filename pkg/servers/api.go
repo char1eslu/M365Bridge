@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -201,12 +202,11 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if len(api.config.APIKeys) > 0 {
-			provided := r.Header.Get("Authorization")
-			if provided == "" {
-				api.sendError(w, http.StatusUnauthorized, "Missing Authorization header")
+			token := api.extractAPIKey(r)
+			if token == "" {
+				api.sendError(w, http.StatusUnauthorized, "Missing Authorization or x-api-key header")
 				return
 			}
-			token := strings.TrimSpace(strings.TrimPrefix(provided, "Bearer "))
 			if !api.isValidAPIKey(token) {
 				api.sendError(w, http.StatusUnauthorized, "Invalid API key")
 				return
@@ -226,14 +226,17 @@ func (api *APIServer) isValidAPIKey(token string) bool {
 	return false
 }
 
-// extractAPIKey gets the bearer token from the Authorization header.
-// Used as a fallback session ID when no explicit session ID is provided.
+// extractAPIKey gets an API key from OpenAI-style Authorization or Anthropic-style x-api-key headers.
+// Used for auth and as a fallback session ID when no explicit session ID is provided.
 func (api *APIServer) extractAPIKey(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		return ""
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if auth != "" {
+		if len(auth) >= 7 && strings.EqualFold(auth[:7], "Bearer ") {
+			return strings.TrimSpace(auth[7:])
+		}
+		return auth
 	}
-	return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	return strings.TrimSpace(r.Header.Get("x-api-key"))
 }
 
 // Stop stops the HTTP server and background token refresher.
@@ -292,7 +295,7 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 func (api *APIServer) handleCORS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Anthropic-Version, X-Session-Id")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -550,7 +553,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	var req struct {
 		Model       string                 `json:"model"`
 		Messages    []payload.Message      `json:"messages"`
-		System      string                 `json:"system"`
+		System      json.RawMessage        `json:"system"`
 		MaxTokens   int                    `json:"max_tokens"`
 		Stream      bool                   `json:"stream"`
 		Temperature float64                `json:"temperature"`
@@ -563,6 +566,12 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	systemText, err := parseAnthropicSystem(req.System)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid system: %v", err))
+		return
+	}
+
 	// Parse optional session ID encoded in model name: "gpt5.5:my-session"
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	// Map Anthropic model to internal model
@@ -570,8 +579,8 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 
 	// Build chat messages with system prompt prepended
 	chatMessages := []payload.Message{}
-	if req.System != "" {
-		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: req.System})
+	if systemText != "" {
+		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: systemText})
 	}
 	chatMessages = append(chatMessages, req.Messages...)
 
@@ -603,6 +612,33 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	} else {
 		api.nonStreamAnthropicMessages(w, chatMessages, cfg, req.Model, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	}
+}
+
+func parseAnthropicSystem(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, nil
+	}
+
+	var blocks []map[string]interface{}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return "", errors.New("must be a string or an array of content blocks")
+	}
+
+	var sb strings.Builder
+	for _, block := range blocks {
+		if blockType, _ := block["type"].(string); blockType != "text" {
+			continue
+		}
+		if txt, _ := block["text"].(string); txt != "" {
+			sb.WriteString(txt)
+		}
+	}
+	return sb.String(), nil
 }
 
 // handleAnthropicComplete handles Anthropic complete (FIM) requests.
@@ -783,7 +819,6 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 			}
 		}
 	}
-
 
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {

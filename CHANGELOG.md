@@ -5,6 +5,14 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-07-07
+
+### Added
+- OpenAI Responses Compact API endpoint (`/v1/responses/compact`) for Codex remote compaction (streaming + non-streaming)
+
+### Changed
+- Documentation: add `/v1/responses/compact` endpoint docs to README, README.tr, AGENTS.md, and CLAUDE.md
+
 ## [1.2.0] - 2026-07-07
 
 ### Added

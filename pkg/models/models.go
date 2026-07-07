@@ -5,11 +5,13 @@ package models
 import (
 	"os"
 	"strings"
+
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
 
 // Version is the application version, shared across all binaries.
 // Overridable at build time via ldflags: -X github.com/KilimcininKorOglu/M365Bridge/pkg/models.Version=x.y.z
-var Version = "1.1.0"
+var Version = "1.2.0"
 
 const (
 	// DefaultClientID is the default Microsoft 365 Copilot client ID.
@@ -86,11 +88,11 @@ var ToolMessageType = map[string]string{
 
 // Config holds environment-based configuration.
 type Config struct {
-	TenantID        string
-	UserOID         string
-	ClientID        string
-	Scope           string
-	APIKeys         []string
+	TenantID string
+	UserOID  string
+	ClientID string
+	Scope    string
+	APIKeys  []string
 }
 
 // LoadConfig loads configuration from .env file and environment variables.
@@ -99,13 +101,16 @@ func LoadConfig() *Config {
 	// Load .env file if it exists
 	loadDotEnv()
 
-	return &Config{
-		TenantID:        os.Getenv("M365_TENANT_ID"),
-		UserOID:         os.Getenv("M365_USER_OID"),
-		ClientID:        getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
-		Scope:           DefaultScope,
-		APIKeys:         parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
+	cfg := &Config{
+		TenantID: os.Getenv("M365_TENANT_ID"),
+		UserOID:  os.Getenv("M365_USER_OID"),
+		ClientID: getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
+		Scope:    DefaultScope,
+		APIKeys:  parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
 	}
+
+	logging.Infof("LoadConfig: tenantID=%s userOID=%s clientID=%s apiKeys=%d", cfg.TenantID, cfg.UserOID, cfg.ClientID[:min(8, len(cfg.ClientID))]+"...", len(cfg.APIKeys))
+	return cfg
 }
 
 // parseAPIKeys builds the API key list from M365_API_KEYS (comma-separated)

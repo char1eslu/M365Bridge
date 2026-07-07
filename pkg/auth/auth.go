@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/crypto"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
 
 var (
@@ -46,6 +47,7 @@ type TokenManager struct {
 	refreshFile string
 	cacheFile   string
 	tokenURL    string
+	userOID     string
 }
 
 // NewTokenManager creates a new TokenManager instance.
@@ -60,14 +62,21 @@ func NewTokenManager(tenant, clientID, scope, refreshFile, cacheFile string) *To
 	}
 }
 
+// SetUserOID sets the user object ID for broker token requests.
+func (tm *TokenManager) SetUserOID(oid string) {
+	tm.userOID = oid
+}
+
 // Get returns a valid access token, refreshing if necessary.
 // Returns cached token if valid, otherwise performs token refresh.
 func (tm *TokenManager) Get() (string, error) {
 	// Try to load from cache first
 	if token, err := tm.loadFromCache(); err == nil {
+		logging.Debug("TokenManager.Get: cache hit")
 		return token, nil
 	}
 
+	logging.Debug("TokenManager.Get: cache miss, refreshing")
 	// Cache miss or expired, perform refresh
 	return tm.Refresh()
 }
@@ -75,8 +84,10 @@ func (tm *TokenManager) Get() (string, error) {
 // Refresh exchanges the refresh token for a new access token.
 // Updates both the refresh token file and cache file.
 func (tm *TokenManager) Refresh() (string, error) {
+	logging.Info("TokenManager.Refresh: starting token refresh")
 	refreshToken, err := tm.readRefreshToken()
 	if err != nil {
+		logging.Errorf("TokenManager.Refresh: failed to read refresh token: %v", err)
 		return "", err
 	}
 
@@ -111,8 +122,10 @@ func (tm *TokenManager) Refresh() (string, error) {
 		errMsg := string(body)
 		// If refresh token expired (AADSTS700084), try SSO cookie re-auth as fallback
 		if strings.Contains(errMsg, "AADSTS700084") && hasSSOCookies() {
+			logging.Warn("TokenManager.Refresh: refresh token expired (AADSTS700084), falling back to SSO cookie re-auth")
 			return tm.reauthWithSSO()
 		}
+		logging.Errorf("TokenManager.Refresh: token refresh failed status=%d: %s", resp.StatusCode, errMsg[:min(200, len(errMsg))])
 		return "", fmt.Errorf("%w: status %d: %s", ErrRefreshFailed, resp.StatusCode, errMsg)
 	}
 
@@ -123,12 +136,14 @@ func (tm *TokenManager) Refresh() (string, error) {
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
+		logging.Errorf("TokenManager.Refresh: failed to parse response: %v", err)
 		return "", fmt.Errorf("%w: failed to parse response", ErrRefreshFailed)
 	}
 
 	// Save new refresh token if provided
 	if result.RefreshToken != "" {
 		if err := tm.writeRefreshToken(result.RefreshToken); err != nil {
+			logging.Errorf("TokenManager.Refresh: failed to save refresh token: %v", err)
 			return "", fmt.Errorf("%w: failed to save refresh token", ErrRefreshFailed)
 		}
 	}
@@ -141,9 +156,11 @@ func (tm *TokenManager) Refresh() (string, error) {
 	}
 
 	if err := tm.writeCache(cache); err != nil {
+		logging.Errorf("TokenManager.Refresh: failed to write cache: %v", err)
 		return "", fmt.Errorf("%w: failed to write cache", ErrRefreshFailed)
 	}
 
+	logging.Infof("TokenManager.Refresh: success, expires_in=%d expires_at=%s", result.ExpiresIn, expiresAt.Format(time.RFC3339))
 	return result.AccessToken, nil
 }
 

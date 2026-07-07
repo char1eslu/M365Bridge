@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
 
 const (
@@ -23,10 +25,10 @@ const (
 
 // TokenRefreshError is returned when token refresh operations fail.
 var (
-	ErrKeyGeneration   = errors.New("failed to generate encryption key")
-	ErrEncryption      = errors.New("encryption failed")
-	ErrDecryption      = errors.New("decryption failed")
-	ErrInvalidKey      = errors.New("invalid key length")
+	ErrKeyGeneration     = errors.New("failed to generate encryption key")
+	ErrEncryption        = errors.New("encryption failed")
+	ErrDecryption        = errors.New("decryption failed")
+	ErrInvalidKey        = errors.New("invalid key length")
 	ErrInvalidCiphertext = errors.New("invalid ciphertext")
 )
 
@@ -45,10 +47,12 @@ func loadOrCreateKey() ([]byte, error) {
 
 	// Try to load existing key
 	if keyData, err := os.ReadFile(keyPath); err == nil {
+		logging.Debug("crypto: loaded existing encryption key")
 		return keyData, nil
 	}
 
 	// Create new key
+	logging.Info("crypto: creating new encryption key")
 	keyDir := filepath.Dir(keyPath)
 	if err := os.MkdirAll(keyDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create key directory: %w", err)

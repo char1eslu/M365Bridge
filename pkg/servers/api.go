@@ -10,8 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +21,7 @@ import (
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
@@ -171,15 +172,17 @@ func (api *APIServer) Start(port int) error {
 	go api.runTokenRefresher()
 
 	if len(api.config.APIKeys) > 0 {
-		log.Printf("Starting API server on port %d (API key required, %d key(s) configured)", port, len(api.config.APIKeys))
+		logging.Infof("Starting API server on port %d (API key required, %d key(s) configured)", port, len(api.config.APIKeys))
 	} else {
-		log.Printf("Starting API server on port %d (no API key required)", port)
+		logging.Infof("Starting API server on port %d (no API key required)", port)
 	}
 	return api.server.ListenAndServe()
 }
 
 // runTokenRefresher periodically refreshes the access token in the background.
 // This prevents the first request after token expiry from blocking 1-2 seconds.
+// Also refreshes the designerapp broker token to keep the broker refresh token
+// alive (broker RT has a 24h lifetime and must be rotated before expiry).
 func (api *APIServer) runTokenRefresher() {
 	ticker := time.NewTicker(tokenRefreshInterval)
 	defer ticker.Stop()
@@ -187,12 +190,20 @@ func (api *APIServer) runTokenRefresher() {
 	for {
 		select {
 		case <-api.stopCh:
+			logging.Info("Token refresher stopping")
 			return
 		case <-ticker.C:
+			logging.Debug("Token refresher: starting periodic refresh")
 			if _, err := api.tokenManager.Refresh(); err != nil {
-				log.Printf("Background token refresh failed: %v", err)
+				logging.Errorf("Background token refresh failed: %v", err)
 			} else {
-				log.Println("Background token refresh succeeded")
+				logging.Info("Background token refresh succeeded")
+			}
+			// Refresh designer token to keep broker RT rotated
+			if _, err := api.tokenManager.GetDesignerToken(); err != nil {
+				logging.Errorf("Background designer token refresh failed: %v", err)
+			} else {
+				logging.Debug("Background designer token refresh succeeded")
 			}
 		}
 	}
@@ -202,6 +213,7 @@ func (api *APIServer) runTokenRefresher() {
 // If no API keys are configured, all requests are allowed (backward compatible).
 func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		logging.Debugf("Request: %s %s %s", r.Method, r.URL.Path, r.RemoteAddr)
 		if r.Method == http.MethodOptions {
 			next(w, r)
 			return
@@ -209,10 +221,12 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		if len(api.config.APIKeys) > 0 {
 			token := api.extractAPIKey(r)
 			if token == "" {
+				logging.Warnf("Auth: missing Authorization/x-api-key header from %s", r.RemoteAddr)
 				api.sendError(w, http.StatusUnauthorized, "Missing Authorization or x-api-key header")
 				return
 			}
 			if !api.isValidAPIKey(token) {
+				logging.Warnf("Auth: invalid API key from %s", r.RemoteAddr)
 				api.sendError(w, http.StatusUnauthorized, "Invalid API key")
 				return
 			}
@@ -425,6 +439,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		logging.Errorf("handleChatCompletions: invalid JSON: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -433,9 +448,11 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	cfg := models.LookupModel(modelKey)
 	if cfg.OpenAIID == "" {
+		logging.Errorf("handleChatCompletions: unknown model: %s", modelKey)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
+	logging.Infof("handleChatCompletions: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
 	// Handle JSON mode
 	if req.ResponseFormat != nil {
@@ -567,6 +584,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		logging.Errorf("handleAnthropicMessages: invalid JSON: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -581,6 +599,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	// Map Anthropic model to internal model
 	cfg := models.LookupModel(modelKey)
+	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
 	// Build chat messages with system prompt prepended
 	chatMessages := []payload.Message{}
@@ -1660,6 +1679,8 @@ func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convI
 		return
 	}
 
+	logging.Infof("uploadImagesAndAnnotate: uploading %d images for message[%d] convID=%s", len((*messages)[lastImgIdx].Images), lastImgIdx, convID)
+
 	// Use existing convID or generate a temporary UUID for upload
 	uploadConvID := convID
 	if uploadConvID == "" {
@@ -1670,11 +1691,11 @@ func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convI
 	for _, img := range msg.Images {
 		result, err := api.m365Client.UploadFile(img.Base64, img.MediaType, img.FileName, uploadConvID, api.config.UserOID, api.config.TenantID)
 		if err != nil {
-			log.Printf("Image upload failed: %v", err)
+			logging.Errorf("Image upload failed: %v", err)
 			continue
 		}
 		if !result.IsSuccess {
-			log.Printf("Image upload returned non-success: %+v", result)
+			logging.Warnf("Image upload returned non-success: %+v", result)
 			continue
 		}
 
@@ -1826,7 +1847,7 @@ func init() {
 	if err != nil {
 		enc, err = tiktoken.GetEncoding("cl100k_base")
 		if err != nil {
-			log.Printf("Failed to init tiktoken encoder, falling back to space split: %v", err)
+			logging.Warnf("Failed to init tiktoken encoder, falling back to space split: %v", err)
 		}
 	}
 	tokenEncoder = enc
@@ -2135,12 +2156,12 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 	}
 
 	resp := map[string]interface{}{
-		"id":         responseID,
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     status,
-		"model":      model,
-		"output":     output,
+		"id":          responseID,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      status,
+		"model":       model,
+		"output":      output,
 		"output_text": text,
 		"usage": map[string]interface{}{
 			"input_tokens":     promptTok,
@@ -2339,20 +2360,20 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					sendEvent("response.output_item.added", map[string]interface{}{
 						"output_index": outputIdx,
 						"item": map[string]interface{}{
-							"id":     msgID,
-							"type":   "message",
-							"status": "in_progress",
-							"role":   "assistant",
+							"id":      msgID,
+							"type":    "message",
+							"status":  "in_progress",
+							"role":    "assistant",
 							"content": []interface{}{},
 						},
 					})
 					sendEvent("response.content_part.added", map[string]interface{}{
-						"item_id":      msgID,
-						"output_index": outputIdx,
+						"item_id":       msgID,
+						"output_index":  outputIdx,
 						"content_index": 0,
 						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": "",
+							"type":        "output_text",
+							"text":        "",
 							"annotations": []interface{}{},
 						},
 					})
@@ -2509,20 +2530,20 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			sendEvent("response.output_item.added", map[string]interface{}{
 				"output_index": outputIdx,
 				"item": map[string]interface{}{
-					"id":     msgID,
-					"type":   "message",
-					"status": "in_progress",
-					"role":   "assistant",
+					"id":      msgID,
+					"type":    "message",
+					"status":  "in_progress",
+					"role":    "assistant",
 					"content": []interface{}{},
 				},
 			})
 			sendEvent("response.content_part.added", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": "",
+					"type":        "output_text",
+					"text":        "",
 					"annotations": []interface{}{},
 				},
 			})
@@ -2539,12 +2560,12 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				"text":          fullText,
 			})
 			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
+					"type":        "output_text",
+					"text":        fullText,
 					"annotations": []interface{}{},
 				},
 			})
@@ -2582,12 +2603,12 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				"text":          fullText,
 			})
 			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
+					"type":        "output_text",
+					"text":        fullText,
 					"annotations": []interface{}{},
 				},
 			})
@@ -2677,6 +2698,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 
 	var req imageGenerationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logging.Errorf("handleImageGenerations: invalid JSON: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -2684,6 +2706,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 		api.sendError(w, http.StatusBadRequest, "prompt is required")
 		return
 	}
+	logging.Infof("handleImageGenerations: model=%s n=%d size=%s responseFormat=%s sid=%s", req.Model, req.N, req.Size, req.ResponseFormat, req.SessionID)
 	if req.N <= 0 {
 		req.N = 1
 	}
@@ -2739,7 +2762,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Extract image URLs from markdown in response text
-	dataItems := buildOpenAIImageData(respText, req.N, req.Prompt, req.ResponseFormat)
+	dataItems := api.buildOpenAIImageData(respText, req.N, req.Prompt, req.ResponseFormat)
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No images were generated. The model may not have produced an image.")
 		return
@@ -2766,6 +2789,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 
 	// Parse multipart form
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		logging.Errorf("handleImageEdits: failed to parse multipart form: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse multipart form: %v", err))
 		return
 	}
@@ -2786,6 +2810,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
+	logging.Infof("handleImageEdits: model=%s prompt_len=%d images=%d responseFormat=%s", modelKey, len(prompt), len(r.MultipartForm.File["image"]), r.FormValue("response_format"))
 
 	n := 1
 	if nStr := r.FormValue("n"); nStr != "" {
@@ -2798,27 +2823,43 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	style := r.FormValue("style")
 	responseFormat := r.FormValue("response_format")
 
-	// Read image file
-	imageFile, imageHeader, err := r.FormFile("image")
-	if err != nil {
+	// Read image file(s). OpenAI API supports up to 16 images for GPT image models.
+	// Multipart form-data may send "image" as multiple form files.
+	imageFiles := r.MultipartForm.File["image"]
+	if len(imageFiles) == 0 {
 		api.sendError(w, http.StatusBadRequest, "image file is required")
 		return
 	}
-	defer imageFile.Close()
 
-	imageBytes, err := io.ReadAll(imageFile)
-	if err != nil {
-		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image: %v", err))
-		return
+	var images []payload.ImageData
+	for i, fh := range imageFiles {
+		if i >= 16 {
+			break
+		}
+		f, err := fh.Open()
+		if err != nil {
+			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to open image %d: %v", i, err))
+			return
+		}
+		imgBytes, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read image %d: %v", i, err))
+			return
+		}
+		imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
+		imgMime := fh.Header.Get("Content-Type")
+		if imgMime == "" {
+			imgMime = "image/png"
+		}
+		imgExt := extFromMediaType(imgMime)
+		imgName := fmt.Sprintf("edit-%d.%s", i, imgExt)
+		images = append(images, payload.ImageData{
+			Base64:    imgB64,
+			MediaType: imgMime,
+			FileName:  imgName,
+		})
 	}
-
-	imageB64 := base64.StdEncoding.EncodeToString(imageBytes)
-	mimeType := imageHeader.Header.Get("Content-Type")
-	if mimeType == "" {
-		mimeType = "image/png"
-	}
-	fileExt := extFromMediaType(mimeType)
-	fileName := "edit." + fileExt
 
 	// Read optional mask
 	var maskB64, maskFileName, maskMimeType string
@@ -2860,13 +2901,9 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	// Build prompt with hints
 	fullPrompt := buildImagePromptWithHints(prompt, size, quality, style)
 
-	// Build multimodal message with image annotation
+	// Build multimodal message with image annotations
 	msg := payload.Message{Role: "user", Content: fullPrompt}
-	msg.Images = append(msg.Images, payload.ImageData{
-		Base64:    imageB64,
-		MediaType: mimeType,
-		FileName:  fileName,
-	})
+	msg.Images = images
 	if maskB64 != "" {
 		msg.Images = append(msg.Images, payload.ImageData{
 			Base64:    maskB64,
@@ -2894,7 +2931,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract image URLs from response
-	dataItems := buildOpenAIImageData(respText, n, prompt, responseFormat)
+	dataItems := api.buildOpenAIImageData(respText, n, prompt, responseFormat)
 	if len(dataItems) == 0 {
 		api.sendError(w, http.StatusInternalServerError, "No edited images were generated. The model may not have produced an image.")
 		return
@@ -2927,8 +2964,11 @@ func buildImagePromptWithHints(prompt, size, quality, style string) string {
 
 // buildOpenAIImageData extracts image URLs from markdown in the response text
 // and converts them to OpenAI Images API data items. When responseFormat is
-// "b64_json", it downloads each URL and base64-encodes the content.
-func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) []imageDataItem {
+// "b64_json", it downloads each URL and base64-encodes the content. When
+// responseFormat is "url", it also downloads the image and returns a
+// data:image/png;base64,... data URL (falling back to the raw URL on error)
+// since the raw designerapp URL is auth-gated and inaccessible to clients.
+func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat string) []imageDataItem {
 	urls := urlImagePattern.FindAllStringSubmatch(respText, -1)
 	if len(urls) == 0 {
 		return nil
@@ -2952,9 +2992,13 @@ func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat 
 	var items []imageDataItem
 	for _, u := range uniqueURLs {
 		if responseFormat == "b64_json" {
-			b64, err := downloadAndBase64(u)
+			b64, err := api.downloadAndBase64(u)
 			if err != nil {
-				log.Printf("Failed to download image %s: %v", u, err)
+				logging.Errorf("Failed to download image %s: %v", u, err)
+				items = append(items, imageDataItem{
+					URL:           u,
+					RevisedPrompt: revisedPrompt,
+				})
 				continue
 			}
 			items = append(items, imageDataItem{
@@ -2962,8 +3006,19 @@ func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat 
 				RevisedPrompt: revisedPrompt,
 			})
 		} else {
+			// url format: try to download and return as data URL;
+			// fall back to raw URL on error
+			b64, err := api.downloadAndBase64(u)
+			if err != nil {
+				logging.Errorf("Failed to download image for data URL %s: %v", u, err)
+				items = append(items, imageDataItem{
+					URL:           u,
+					RevisedPrompt: revisedPrompt,
+				})
+				continue
+			}
 			items = append(items, imageDataItem{
-				URL:           u,
+				URL:           "data:image/png;base64," + b64,
 				RevisedPrompt: revisedPrompt,
 			})
 		}
@@ -2972,23 +3027,73 @@ func buildOpenAIImageData(respText string, n int, revisedPrompt, responseFormat 
 	return items
 }
 
-// downloadAndBase64 downloads an image URL and returns its base64-encoded content.
-func downloadAndBase64(url string) (string, error) {
-	resp, err := http.Get(url)
+// downloadAndBase64 downloads an image from a designerapp URL and returns its
+// base64-encoded content. designerapp URLs require a JWE access token (acquired
+// via SSO cookies with the M365 web app client_id) and the fileToken query
+// parameter sent as a header.
+func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
+	logging.Infof("downloadAndBase64: downloading image from %s", imageURL[:min(100, len(imageURL))])
+	parsedURL, err := neturl.Parse(imageURL)
+	if err != nil {
+		logging.Errorf("downloadAndBase64: invalid URL: %v", err)
+		return "", fmt.Errorf("invalid image URL: %w", err)
+	}
+
+	// Extract fileToken from query params and remove it from the URL
+	query := parsedURL.Query()
+	fileToken := query.Get("fileToken")
+	if fileToken == "" {
+		logging.Errorf("downloadAndBase64: no fileToken in URL")
+		return "", fmt.Errorf("no fileToken in image URL")
+	}
+	query.Del("fileToken")
+	parsedURL.RawQuery = query.Encode()
+	cleanURL := parsedURL.String()
+
+	// Acquire designerapp access token via SSO cookies
+	token, err := api.tokenManager.GetDesignerToken()
+	if err != nil {
+		return "", fmt.Errorf("failed to acquire designer token: %w", err)
+	}
+
+	req, err := http.NewRequest("GET", cleanURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create image request: %w", err)
+	}
+	req.Header.Set("Authorization", token)
+	req.Header.Set("filetoken", fileToken)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Origin", "https://m365.cloud.microsoft")
+	req.Header.Set("Referer", "https://m365.cloud.microsoft/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		errCode := resp.Header.Get("X-Errorcode")
+		failReason := resp.Header.Get("X-Failurereason")
+		logging.Errorf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
+			resp.StatusCode, errCode, failReason, string(body)[:min(200, len(body))])
+		return "", fmt.Errorf("download returned status %d: x-errorcode=%s, x-failurereason=%s", resp.StatusCode, errCode, failReason)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		logging.Errorf("downloadAndBase64: failed to read body: %v", err)
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	logging.Infof("downloadAndBase64: success, size=%d bytes", len(body))
 	return base64.StdEncoding.EncodeToString(body), nil
 }
 

@@ -3,6 +3,7 @@
 package servers
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -1929,6 +1930,13 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if responsesInputHasCompactionTrigger(req.Input) {
+		logging.Infof("handleResponses: detected compaction_trigger; routing to /v1/responses/compact")
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		api.handleResponsesCompact(w, r)
+		return
+	}
+
 	// Parse model (may contain session ID suffix: "gpt5.5:my-session")
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	cfg := models.LookupModel(modelKey)
@@ -2045,6 +2053,10 @@ func responsesInputToMessages(input interface{}) []payload.Message {
 			continue
 		}
 
+		if itemType == "compaction_trigger" {
+			continue
+		}
+
 		// Message items (type "message" or items with role)
 		role, _ := m["role"].(string)
 		if role == "" {
@@ -2062,6 +2074,23 @@ func responsesInputToMessages(input interface{}) []payload.Message {
 		return []payload.Message{{Role: "user", Content: ""}}
 	}
 	return messages
+}
+
+func responsesInputHasCompactionTrigger(input interface{}) bool {
+	arr, ok := input.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, item := range arr {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if itemType, _ := m["type"].(string); itemType == "compaction_trigger" {
+			return true
+		}
+	}
+	return false
 }
 
 // responsesExtractContent extracts text from a content field that may be a

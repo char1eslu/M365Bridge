@@ -515,15 +515,24 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read request body: %v", err))
+		return
+	}
+	r.Body.Close()
+
 	var req struct {
-		Model     string `json:"model"`
-		Prompt    string `json:"prompt"`
-		Suffix    string `json:"suffix"`
-		Stream    bool   `json:"stream"`
-		MaxTokens int    `json:"max_tokens"`
+		Model      string                `json:"model"`
+		Prompt     string                `json:"prompt"`
+		Suffix     string                `json:"suffix"`
+		Stream     bool                  `json:"stream"`
+		MaxTokens  int                   `json:"max_tokens"`
+		Tools      []toolcalling.ToolDef `json:"tools"`
+		ToolChoice interface{}           `json:"tool_choice"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -539,6 +548,11 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 	// Convert FIM to chat format
 	messages := api.fimToChat(req.Prompt, req.Suffix)
 
+	// Inject simulated tool prompt if tool calling is enabled
+	if len(req.Tools) > 0 {
+		injectSimulatedPrompt(&messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+	}
+
 	// Resolve session ID and conversation ID
 	sid := modelSessionID
 	if sid == "" {
@@ -549,10 +563,12 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 		convID = api.ctxCache.Get("session:" + sid)
 	}
 
+	hasTools := len(req.Tools) > 0
+
 	if req.Stream {
-		api.streamCompletions(w, messages, cfg, req.MaxTokens, sid, convID)
+		api.streamCompletions(w, messages, cfg, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	} else {
-		api.nonStreamCompletions(w, messages, cfg, req.MaxTokens, sid, convID)
+		api.nonStreamCompletions(w, messages, cfg, req.MaxTokens, sid, convID, hasTools, req.Tools)
 	}
 }
 
@@ -707,14 +723,23 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 		convID = api.ctxCache.Get("session:" + sid)
 	}
 
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	if req.Stream {
+		api.streamAnthropicComplete(w, messages, cfg, req.Model, req.MaxTokensToSample, req.StopSequences, sid, convID)
+	} else {
+		api.nonStreamAnthropicComplete(w, messages, cfg, req.Model, req.MaxTokensToSample, req.StopSequences, sid, convID)
+	}
+}
+
+// nonStreamAnthropicComplete handles non-streaming Anthropic complete (FIM) requests.
+func (api *APIServer) nonStreamAnthropicComplete(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, model string, maxTokens int, stopSequences []string, sid, convID string) {
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return
 	}
 
 	stopReason := "end_turn"
-	for _, s := range req.StopSequences {
+	for _, s := range stopSequences {
 		if strings.Contains(respText, s) {
 			stopReason = "stop_sequence"
 			break
@@ -722,8 +747,8 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 	}
 
 	// Enforce max_tokens_to_sample on response text
-	if req.MaxTokensToSample > 0 {
-		if truncated, ok := truncateToTokens(respText, req.MaxTokensToSample); ok {
+	if maxTokens > 0 {
+		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
 			respText = truncated
 			stopReason = "max_tokens"
 		}
@@ -732,7 +757,7 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 	response := map[string]interface{}{
 		"completion":  respText,
 		"stop_reason": stopReason,
-		"model":       req.Model,
+		"model":       model,
 		"stop":        nil,
 		"log_id":      fmt.Sprintf("cmpl_%s", uuid.New().String()),
 	}
@@ -741,8 +766,121 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
+		}
+	}
+}
+
+// streamAnthropicComplete streams Anthropic complete (FIM) responses.
+// Anthropic Complete streaming uses SSE with event: completion and
+// data containing {"type":"completion","completion":"<delta>","stop_reason":null}.
+// The final event has stop_reason set and completion empty.
+func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, model string, maxTokens int, stopSequences []string, sid, convID string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		api.sendError(w, http.StatusInternalServerError, "Streaming not supported")
+		return
+	}
+
+	logID := fmt.Sprintf("cmpl_%s", uuid.New().String())
+
+	// Send ping event (Anthropic streaming starts with ping)
+	pingData := map[string]interface{}{"type": "ping"}
+	pingJSON, _ := json.Marshal(pingData)
+	fmt.Fprintf(w, "event: ping\ndata: %s\n\n", pingJSON)
+	flusher.Flush()
+
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+
+	fullText := ""
+	thinkingText := ""
+	truncated := false
+
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
+	for chunk := range ch {
+		if chunk.Error != nil {
+			errData := map[string]interface{}{
+				"type":  "error",
+				"error": map[string]interface{}{"type": "server_error", "message": chunk.Error.Error()},
+			}
+			errJSON, _ := json.Marshal(errData)
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
+			flusher.Flush()
+			return
+		}
+
+		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
+			break
+		}
+
+		// Accumulate thinking (not sent as content for Complete API)
+		if chunk.Thinking != "" {
+			thinkingText += chunk.Thinking
+			continue
+		}
+
+		// Check max_tokens limit
+		if maxTokens > 0 && countTokens(fullText) >= maxTokens {
+			truncated = true
+			for range ch {
+			}
+			break
+		}
+
+		fullText += chunk.Text
+
+		// Send completion event with delta text
+		compData := map[string]interface{}{
+			"type":        "completion",
+			"completion":  chunk.Text,
+			"stop_reason": nil,
+			"model":       model,
+			"log_id":      logID,
+		}
+		compJSON, _ := json.Marshal(compData)
+		fmt.Fprintf(w, "event: completion\ndata: %s\n\n", compJSON)
+		flusher.Flush()
+	}
+	_ = finalToolCalls
+
+	// Determine stop reason
+	stopReason := "end_turn"
+	for _, s := range stopSequences {
+		if strings.Contains(fullText, s) {
+			stopReason = "stop_sequence"
+			break
+		}
+	}
+	if truncated {
+		stopReason = "max_tokens"
+	}
+
+	// Send final completion event with stop_reason
+	finalData := map[string]interface{}{
+		"type":        "completion",
+		"completion":  "",
+		"stop_reason": stopReason,
+		"model":       model,
+		"stop":        nil,
+		"log_id":      logID,
+	}
+	finalJSON, _ := json.Marshal(finalData)
+	fmt.Fprintf(w, "event: completion\ndata: %s\n\n", finalJSON)
+	flusher.Flush()
+
+	// Cache conversation ID for session continuity
+	if sid != "" {
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -776,6 +914,8 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// text directly regardless of the global ToolCalling flag.
 	toolCallingEnabled := hasTools
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			api.sendSSEError(w, chunkID, openaiModel, chunk.Error)
@@ -783,6 +923,8 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -863,9 +1005,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	}
 
 	// Send tool calls in stream if any (from M365 backend or simulated)
-	api.mu.RLock()
-	toolCalls := api.m365Client.LastToolCalls()
-	api.mu.RUnlock()
+	toolCalls := finalToolCalls
 
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
@@ -932,15 +1072,15 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
 
 // nonStreamChatCompletions handles non-streaming chat completion in OpenAI format.
 func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -1044,8 +1184,8 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -1095,6 +1235,8 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	toolCallingEnabled := hasTools
 	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			errEvent := map[string]interface{}{
@@ -1110,6 +1252,8 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -1218,9 +1362,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	}
 
 	// Send tool_use content blocks if any (server-side tools from M365 backend or simulated)
-	api.mu.RLock()
-	toolCalls := api.m365Client.LastToolCalls()
-	api.mu.RUnlock()
+	toolCalls := finalToolCalls
 
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
@@ -1291,15 +1433,15 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
 
 // nonStreamAnthropicMessages handles non-streaming Anthropic messages response.
 func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -1395,14 +1537,14 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
 
 // streamCompletions streams text completion responses in OpenAI text_completion format.
-func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string) {
+func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -1417,12 +1559,15 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	compID := fmt.Sprintf("cmpl-%s", uuid.New().String())
 	openaiModel := cfg.OpenAIID
 
-	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	fullText := ""
 	thinkingText := ""
 	truncated := false
+	toolCallingEnabled := hasTools
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			errChunk := map[string]interface{}{
@@ -1447,6 +1592,8 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -1466,6 +1613,46 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 
 		fullText += chunk.Text
 
+		// If tool calling is not enabled, stream text directly
+		if !toolCallingEnabled {
+			chunkData := map[string]interface{}{
+				"id":      compID,
+				"object":  "text_completion",
+				"created": time.Now().Unix(),
+				"model":   openaiModel,
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"text":          chunk.Text,
+						"finish_reason": nil,
+						"logprobs":      nil,
+					},
+				},
+			}
+
+			jsonData, _ := json.Marshal(chunkData)
+			fmt.Fprintf(w, "data: %s\n\n", jsonData)
+			flusher.Flush()
+		}
+	}
+	_ = finalToolCalls
+
+	// Parse simulated tool calls from buffered text if tool calling is enabled
+	var simToolCalls []toolcalling.ToolCall
+	if toolCallingEnabled {
+		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				simToolCalls = sim.ToolCalls
+				fullText = ""
+			} else {
+				fullText = sim.Content
+			}
+		}
+	}
+
+	// If tool calling buffered text, send it now as a single chunk
+	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
 		chunkData := map[string]interface{}{
 			"id":      compID,
 			"object":  "text_completion",
@@ -1474,13 +1661,12 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 			"choices": []map[string]interface{}{
 				{
 					"index":         0,
-					"text":          chunk.Text,
+					"text":          fullText,
 					"finish_reason": nil,
 					"logprobs":      nil,
 				},
 			},
 		}
-
 		jsonData, _ := json.Marshal(chunkData)
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
 		flusher.Flush()
@@ -1490,6 +1676,9 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	finishReason := "stop"
 	if truncated {
 		finishReason = "length"
+	}
+	if len(simToolCalls) > 0 {
+		finishReason = "tool_calls"
 	}
 	doneChunk := map[string]interface{}{
 		"id":      compID,
@@ -1512,22 +1701,49 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
 
 // nonStreamCompletions handles non-streaming text completion.
-func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string) {
-	respText, thinking, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return
 	}
 
+	// In simulated mode, discard backend-injected tool calls
+	if hasTools {
+		toolCalls = nil
+	}
+
+	// Parse simulated tool calls from response text
+	if hasTools {
+		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
+		if sim.HasPayload {
+			if len(sim.ToolCalls) > 0 {
+				finishReason = "tool_calls"
+				for _, pc := range sim.ToolCalls {
+					toolCalls = append(toolCalls, client.ToolCall{
+						ID:       pc.ID,
+						Type:     "function",
+						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+					})
+				}
+				respText = ""
+			} else {
+				respText = sim.Content
+				finishReason = "stop"
+			}
+		} else {
+			finishReason = "stop"
+		}
+	}
+
 	// Enforce max_tokens on response text
-	finishReason := "stop"
 	if maxTokens > 0 {
 		if truncated, ok := truncateToTokens(respText, maxTokens); ok {
 			respText = truncated
@@ -1539,19 +1755,24 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 	promptTok := countTokens(promptStr)
 	completionTok := countTokens(respText)
 	reasoningTok := countTokens(thinking)
+
+	// Build choices
+	choices := []map[string]interface{}{
+		{
+			"index":         0,
+			"text":          respText,
+			"finish_reason": finishReason,
+			"logprobs":      nil,
+		},
+	}
+
+	// Add tool calls to response if present (non-standard extension for text_completion)
 	response := map[string]interface{}{
 		"id":      fmt.Sprintf("cmpl-%s", uuid.New().String()),
 		"object":  "text_completion",
 		"created": time.Now().Unix(),
 		"model":   cfg.OpenAIID,
-		"choices": []map[string]interface{}{
-			{
-				"index":         0,
-				"text":          respText,
-				"finish_reason": finishReason,
-				"logprobs":      nil,
-			},
-		},
+		"choices": choices,
 		"usage": map[string]interface{}{
 			"prompt_tokens":     promptTok,
 			"completion_tokens": completionTok,
@@ -1560,12 +1781,28 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 		},
 	}
 
+	if len(toolCalls) > 0 {
+		openaiToolCalls := make([]map[string]interface{}, len(toolCalls))
+		for i, tc := range toolCalls {
+			openaiToolCalls[i] = map[string]interface{}{
+				"index": i,
+				"id":    tc.ID,
+				"type":  "function",
+				"function": map[string]string{
+					"name":      tc.Function.Name,
+					"arguments": tc.Function.Arguments,
+				},
+			}
+		}
+		response["tool_calls"] = openaiToolCalls
+	}
+
 	api.sendJSON(w, http.StatusOK, response)
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -2205,7 +2442,7 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 
 // nonStreamResponses handles non-streaming Responses API requests.
 func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -2259,8 +2496,8 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -2324,6 +2561,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	msgID := fmt.Sprintf("msg_%s", responseID)
 	reasoningID := fmt.Sprintf("rs_%s", responseID)
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			sendEvent("response.failed", map[string]interface{}{
@@ -2342,6 +2581,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -2452,6 +2693,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			}
 		}
 	}
+	_ = finalToolCalls
 
 	// Finalize reasoning item if emitted
 	if reasoningItemEmitted && !toolCallingEnabled {
@@ -2684,8 +2926,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -2825,7 +3067,7 @@ func buildCompactionResponseObject(responseID, model, summaryText string, prompt
 
 // nonStreamResponsesCompact handles non-streaming compact requests.
 func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		logging.Errorf("nonStreamResponsesCompact: chat failed: %v", err)
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Compaction failed: %v", err))
@@ -2858,8 +3100,8 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -2914,6 +3156,8 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	fullText := ""
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
@@ -2934,6 +3178,7 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 			fullText += chunk.Text
 		}
 	}
+	_ = finalToolCalls
 
 	// In simulated mode, extract plain content
 	if hasTools {
@@ -2984,8 +3229,8 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -3078,7 +3323,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 
 	messages := []payload.Message{{Role: "user", Content: fullPrompt}}
 
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image generation failed: %v", err))
 		return
@@ -3086,8 +3331,8 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 
 	// Cache conversation ID
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 
@@ -3247,7 +3492,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	// Upload images and attach annotations
 	api.uploadImagesAndAnnotate(&messages, convID)
 
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image edit failed: %v", err))
 		return
@@ -3255,8 +3500,8 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 
 	// Cache conversation ID
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 

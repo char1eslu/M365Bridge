@@ -619,7 +619,6 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	cfg := models.LookupModel(modelKey)
 	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
-	// Build chat messages with system prompt prepended
 	chatMessages := []payload.Message{}
 	if systemText != "" {
 		chatMessages = append(chatMessages, payload.Message{Role: "system", Content: systemText})

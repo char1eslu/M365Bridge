@@ -78,6 +78,7 @@ func BuildSimulatedPromptResponses(requestJSON string, hasTools bool, toolChoice
 			`If returning tool calls, use choices[0].message.tool_calls and set choices[0].finish_reason to "tool_calls".`,
 			`If returning plain text, use choices[0].message.content and set choices[0].finish_reason to "stop".`,
 			"For each tool call, function.arguments must be a JSON string value (not an object).",
+			`For a function inside a "type": "namespace" tool, keep the short function name and copy the enclosing namespace name into the tool call's "namespace" field.`,
 			"CRITICAL: Only use tool names that appear in the tools array or in a prior tool_search_output item. Never invent tool names.",
 			`A tool entry with "type": "tool_search" is callable as "tool_search" and can load additional tools when needed.`,
 			"Do not use code_interpreter, web_search, or another built-in tool unless its exact name is in the callable set.",
@@ -304,6 +305,9 @@ func parseAnthropicPayload(payload map[string]interface{}, result *SimulatedResu
 		result.FinishReason = "tool_calls"
 		return
 	}
+	if result.FinishReason == "tool_calls" {
+		result.FinishReason = "stop"
+	}
 	result.Content = strings.Join(textParts, "\n")
 }
 
@@ -385,7 +389,7 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 			if !ok {
 				continue
 			}
-			name, id, args := extractToolCallFields(tc)
+			name, namespace, id, args := extractToolCallFields(tc)
 			if name == "" {
 				continue
 			}
@@ -398,6 +402,7 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
 				ID:        id,
 				Name:      name,
+				Namespace: namespace,
 				Arguments: json.RawMessage(args),
 			})
 		}
@@ -405,6 +410,9 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 			result.Content = ""
 			result.FinishReason = "tool_calls"
 			return
+		}
+		if result.FinishReason == "tool_calls" {
+			result.FinishReason = "stop"
 		}
 	}
 
@@ -414,10 +422,13 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 // extractToolCallFields pulls id/name/arguments from a tool_calls entry,
 // tolerating both the OpenAI wrapper ({id,type,function:{name,arguments}})
 // and a flat shape ({name,arguments}).
-func extractToolCallFields(tc map[string]interface{}) (name, id, args string) {
+func extractToolCallFields(tc map[string]interface{}) (name, namespace, id, args string) {
 	if fn, ok := tc["function"].(map[string]interface{}); ok {
 		if n, ok := fn["name"].(string); ok && n != "" {
 			name = n
+		}
+		if ns, ok := fn["namespace"].(string); ok && ns != "" {
+			namespace = ns
 		}
 		args = normalizeArgumentsJSON(fn["arguments"])
 		if i, ok := tc["id"].(string); ok && i != "" {
@@ -427,6 +438,11 @@ func extractToolCallFields(tc map[string]interface{}) (name, id, args string) {
 	if name == "" {
 		if n, ok := tc["name"].(string); ok && n != "" {
 			name = n
+		}
+	}
+	if namespace == "" {
+		if ns, ok := tc["namespace"].(string); ok && ns != "" {
+			namespace = ns
 		}
 	}
 	if args == "" {

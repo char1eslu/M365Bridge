@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -987,6 +988,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 		}
 	}
 
+
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
 		if !hasContent {
@@ -1650,7 +1652,6 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 		}
 	}
 
-
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
 		chunkData := map[string]interface{}{
@@ -1982,6 +1983,19 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 	}
 }
 
+// injectSimulatedPromptResponses replaces the converted Responses history with
+// one canonical simulation message. The full history remains present exactly
+// once inside requestJSON, avoiding duplicated context at the M365 layer.
+func injectSimulatedPromptResponses(messages *[]payload.Message, requestJSON, toolChoice string) {
+	prompt := toolcalling.BuildSimulatedPromptResponses(requestJSON, true, toolChoice)
+	canonical := payload.Message{Role: "user", Content: prompt}
+	for _, message := range *messages {
+		canonical.Images = append(canonical.Images, message.Images...)
+		canonical.Annotations = append(canonical.Annotations, message.Annotations...)
+	}
+	*messages = []payload.Message{canonical}
+}
+
 // injectSimulatedPromptAnthropic replaces the last user message with a
 // simulated-mode prompt that embeds the entire Anthropic request JSON and asks
 // M365 Copilot to produce a valid Anthropic Messages response in a single
@@ -2028,6 +2042,172 @@ func toolChoiceString(toolChoice interface{}) string {
 		}
 	}
 	return ""
+}
+
+const simulatedToolCallRequiredCode = "simulated_tool_call_required"
+
+var errSimulatedToolCallRequired = errors.New(simulatedToolCallRequiredCode)
+
+type responsesToolPolicy struct {
+	simulate         bool
+	required         bool
+	requiredName     string
+	promptChoice     string
+	allowedToolNames []string
+}
+
+type responsesSimulationResult struct {
+	content      string
+	toolCalls    []client.ToolCall
+	finishReason string
+}
+
+func newResponsesToolPolicy(tools []toolcalling.ToolDef, toolChoice interface{}) (responsesToolPolicy, error) {
+	allNames := make([]string, 0, len(tools))
+	knownNames := make(map[string]bool, len(tools))
+	for i := range tools {
+		name := strings.TrimSpace(toolcalling.ToolName(&tools[i]))
+		if name == "" || knownNames[name] {
+			continue
+		}
+		knownNames[name] = true
+		allNames = append(allNames, name)
+	}
+
+	policy := responsesToolPolicy{
+		simulate:         len(tools) > 0,
+		promptChoice:     "auto",
+		allowedToolNames: allNames,
+	}
+
+	switch choice := toolChoice.(type) {
+	case nil:
+		// Responses defaults to auto when tools are present.
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(choice))
+		switch normalized {
+		case "", "auto":
+		case "none":
+			policy.simulate = false
+			policy.promptChoice = "none"
+			policy.allowedToolNames = nil
+		case "required":
+			policy.required = true
+			policy.promptChoice = "required"
+		default:
+			if !knownNames[choice] {
+				return responsesToolPolicy{}, fmt.Errorf("invalid Responses tool_choice %q", choice)
+			}
+			policy.required = true
+			policy.requiredName = choice
+			policy.promptChoice = choice
+			policy.allowedToolNames = []string{choice}
+		}
+	case map[string]interface{}:
+		name, _ := choice["name"].(string)
+		if name == "" {
+			if function, ok := choice["function"].(map[string]interface{}); ok {
+				name, _ = function["name"].(string)
+			}
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || !knownNames[name] {
+			return responsesToolPolicy{}, fmt.Errorf("invalid Responses named tool_choice %q", name)
+		}
+		policy.required = true
+		policy.requiredName = name
+		policy.promptChoice = name
+		policy.allowedToolNames = []string{name}
+	default:
+		return responsesToolPolicy{}, fmt.Errorf("invalid Responses tool_choice type %T", toolChoice)
+	}
+
+	if policy.simulate && len(policy.allowedToolNames) == 0 {
+		return responsesToolPolicy{}, errors.New("Responses tools must include at least one function name")
+	}
+	if policy.required && !policy.simulate {
+		return responsesToolPolicy{}, errors.New("Responses tool_choice requires at least one tool")
+	}
+	return policy, nil
+}
+
+func parseResponsesSimulation(text string, policy responsesToolPolicy) (responsesSimulationResult, error) {
+	result := responsesSimulationResult{
+		content:      text,
+		finishReason: "stop",
+	}
+	simulated := toolcalling.ParseSimulatedResponse(text, policy.allowedToolNames)
+	if simulated.HasPayload {
+		result.content = simulated.Content
+		if len(simulated.ToolCalls) > 0 {
+			result.content = ""
+			result.finishReason = "tool_calls"
+			for _, parsed := range simulated.ToolCalls {
+				result.toolCalls = append(result.toolCalls, client.ToolCall{
+					ID:   parsed.ID,
+					Type: "function",
+					Function: client.ToolCallFunction{
+						Name:      parsed.Name,
+						Arguments: string(parsed.Arguments),
+					},
+				})
+			}
+		}
+	}
+
+	if policy.required && len(result.toolCalls) == 0 {
+		if policy.requiredName != "" {
+			return responsesSimulationResult{}, fmt.Errorf("%w: required tool %q was not emitted", errSimulatedToolCallRequired, policy.requiredName)
+		}
+		return responsesSimulationResult{}, fmt.Errorf("%w: no valid client tool call was emitted", errSimulatedToolCallRequired)
+	}
+	return result, nil
+}
+
+func responsesReasoningForOutput(thinking string, simulated bool) string {
+	if simulated {
+		return ""
+	}
+	return thinking
+}
+
+func writeResponsesSimulationError(w http.ResponseWriter, stream bool, responseID, model string, err error) {
+	message := err.Error()
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		event := map[string]interface{}{
+			"type": "response.failed",
+			"response": map[string]interface{}{
+				"id":     responseID,
+				"object": "response",
+				"status": "failed",
+				"model":  model,
+				"error": map[string]interface{}{
+					"message": message,
+					"type":    "server_error",
+					"code":    simulatedToolCallRequiredCode,
+				},
+			},
+		}
+		jsonData, _ := json.Marshal(event)
+		fmt.Fprintf(w, "data: %s\n\n", jsonData)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": message,
+			"type":    "server_error",
+			"code":    simulatedToolCallRequiredCode,
+		},
+	})
 }
 
 // parseModelSessionID splits a model string of the form "modelKey:sessionID"
@@ -2175,6 +2355,12 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	toolPolicy, err := newResponsesToolPolicy(req.Tools, req.ToolChoice)
+	if err != nil {
+		api.sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Convert Responses API input to payload.Message list
 	messages := responsesInputToMessages(req.Input)
 
@@ -2187,9 +2373,10 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 		messages = append([]payload.Message{instrMsg}, messages...)
 	}
 
-	// Inject simulated tool prompt if tools are present
-	if len(req.Tools) > 0 {
-		injectSimulatedPrompt(&messages, string(bodyBytes), toolChoiceString(req.ToolChoice))
+	// Inject one Responses-aware simulation prompt unless tool_choice disables
+	// client tool use.
+	if toolPolicy.simulate {
+		injectSimulatedPromptResponses(&messages, string(bodyBytes), toolPolicy.promptChoice)
 	}
 
 	// Resolve session ID
@@ -2219,12 +2406,10 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// Upload any images found in multimodal content
 	api.uploadImagesAndAnnotate(&messages, convID)
 
-	hasTools := len(req.Tools) > 0
-
 	if req.Stream {
-		api.streamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+		api.streamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, toolPolicy)
 	} else {
-		api.nonStreamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, hasTools, req.Tools)
+		api.nonStreamResponses(w, messages, cfg, sid, convID, req.MaxOutputTokens, toolPolicy)
 	}
 }
 
@@ -2413,40 +2598,30 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 }
 
 // nonStreamResponses handles non-streaming Responses API requests.
-func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, toolPolicy responsesToolPolicy) {
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, toolPolicy.simulate)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
 	}
 
 	// In simulated mode, discard backend-injected tool calls
-	if hasTools {
+	if toolPolicy.simulate {
 		toolCalls = nil
 	}
 
 	// Parse simulated tool calls from response text
-	if hasTools {
-		sim := toolcalling.ParseSimulatedResponse(respText, toolNamesFromDefs(tools))
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-					})
-				}
-				respText = ""
-			} else {
-				respText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			finishReason = "stop"
+	if toolPolicy.simulate {
+		simulated, parseErr := parseResponsesSimulation(respText, toolPolicy)
+		if parseErr != nil {
+			writeResponsesSimulationError(w, false, "", cfg.OpenAIID, parseErr)
+			return
 		}
+		respText = simulated.content
+		toolCalls = simulated.toolCalls
+		finishReason = simulated.finishReason
 	}
+	thinking = responsesReasoningForOutput(thinking, toolPolicy.simulate)
 
 	// Enforce max_output_tokens
 	if maxTokens > 0 {
@@ -2475,7 +2650,7 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 }
 
 // streamResponses handles streaming Responses API requests.
-func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
+func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, toolPolicy responsesToolPolicy) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")
@@ -2518,14 +2693,14 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		},
 	})
 
-	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, toolPolicy.simulate)
 
 	fullText := ""
 	thinkingText := ""
 	truncated := false
 
 	// When tool calling is enabled, buffer all text and parse at the end
-	toolCallingEnabled := hasTools
+	toolCallingEnabled := toolPolicy.simulate
 
 	// Track whether we've emitted the message output item
 	messageItemEmitted := false
@@ -2558,34 +2733,33 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			break
 		}
 
-		// Handle thinking/reasoning content
-		if chunk.Thinking != "" {
+		// Simulated tool prompts contain transport JSON in M365 thinking
+		// summaries. Never expose that content as Responses reasoning.
+		if chunk.Thinking != "" && !toolCallingEnabled {
 			thinkingText += chunk.Thinking
 
-			if !toolCallingEnabled {
-				if !reasoningItemEmitted {
-					sendEvent("response.output_item.added", map[string]interface{}{
-						"output_index": 0,
-						"item": map[string]interface{}{
-							"id":     reasoningID,
-							"type":   "reasoning",
-							"status": "in_progress",
-							"summary": []map[string]interface{}{
-								{
-									"type": "summary_text",
-									"text": "",
-								},
+			if !reasoningItemEmitted {
+				sendEvent("response.output_item.added", map[string]interface{}{
+					"output_index": 0,
+					"item": map[string]interface{}{
+						"id":     reasoningID,
+						"type":   "reasoning",
+						"status": "in_progress",
+						"summary": []map[string]interface{}{
+							{
+								"type": "summary_text",
+								"text": "",
 							},
 						},
-					})
-					reasoningItemEmitted = true
-				}
-				sendEvent("response.reasoning_summary_text.delta", map[string]interface{}{
-					"item_id":      reasoningID,
-					"output_index": 0,
-					"delta":        chunk.Thinking,
+					},
 				})
+				reasoningItemEmitted = true
 			}
+			sendEvent("response.reasoning_summary_text.delta", map[string]interface{}{
+				"item_id":      reasoningID,
+				"output_index": 0,
+				"delta":        chunk.Thinking,
+			})
 		}
 
 		// Handle text content
@@ -2603,20 +2777,20 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					sendEvent("response.output_item.added", map[string]interface{}{
 						"output_index": outputIdx,
 						"item": map[string]interface{}{
-							"id":     msgID,
-							"type":   "message",
-							"status": "in_progress",
-							"role":   "assistant",
+							"id":      msgID,
+							"type":    "message",
+							"status":  "in_progress",
+							"role":    "assistant",
 							"content": []interface{}{},
 						},
 					})
 					sendEvent("response.content_part.added", map[string]interface{}{
-						"item_id":      msgID,
-						"output_index": outputIdx,
+						"item_id":       msgID,
+						"output_index":  outputIdx,
 						"content_index": 0,
 						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": "",
+							"type":        "output_text",
+							"text":        "",
 							"annotations": []interface{}{},
 						},
 					})
@@ -2695,25 +2869,14 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	finishReason := "stop"
 
 	if toolCallingEnabled {
-		sim := toolcalling.ParseSimulatedResponse(fullText, toolNamesFromDefs(tools))
-		if sim.HasPayload {
-			if len(sim.ToolCalls) > 0 {
-				finishReason = "tool_calls"
-				for _, pc := range sim.ToolCalls {
-					toolCalls = append(toolCalls, client.ToolCall{
-						ID:       pc.ID,
-						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
-					})
-				}
-				fullText = ""
-			} else {
-				fullText = sim.Content
-				finishReason = "stop"
-			}
-		} else {
-			finishReason = "stop"
+		simulated, parseErr := parseResponsesSimulation(fullText, toolPolicy)
+		if parseErr != nil {
+			writeResponsesSimulationError(w, true, responseID, openaiModel, parseErr)
+			return
 		}
+		fullText = simulated.content
+		toolCalls = simulated.toolCalls
+		finishReason = simulated.finishReason
 
 		// Now emit the buffered text and tool calls as Responses events
 		outputIdx := 0
@@ -2774,20 +2937,20 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			sendEvent("response.output_item.added", map[string]interface{}{
 				"output_index": outputIdx,
 				"item": map[string]interface{}{
-					"id":     msgID,
-					"type":   "message",
-					"status": "in_progress",
-					"role":   "assistant",
+					"id":      msgID,
+					"type":    "message",
+					"status":  "in_progress",
+					"role":    "assistant",
 					"content": []interface{}{},
 				},
 			})
 			sendEvent("response.content_part.added", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": "",
+					"type":        "output_text",
+					"text":        "",
 					"annotations": []interface{}{},
 				},
 			})
@@ -2804,12 +2967,12 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				"text":          fullText,
 			})
 			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
+					"type":        "output_text",
+					"text":        fullText,
 					"annotations": []interface{}{},
 				},
 			})
@@ -2847,12 +3010,12 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				"text":          fullText,
 			})
 			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
 				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
+					"type":        "output_text",
+					"text":        fullText,
 					"annotations": []interface{}{},
 				},
 			})

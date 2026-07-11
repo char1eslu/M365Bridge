@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -238,12 +239,7 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // isValidAPIKey checks if the given token matches any configured API key.
 func (api *APIServer) isValidAPIKey(token string) bool {
-	for _, k := range api.config.APIKeys {
-		if token == k {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(api.config.APIKeys, token)
 }
 
 // extractAPIKey gets the bearer token from the Authorization header.
@@ -290,9 +286,9 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	modelList := []map[string]interface{}{}
+	modelList := []map[string]any{}
 	for _, cfg := range models.ModelRegistry {
-		modelList = append(modelList, map[string]interface{}{
+		modelList = append(modelList, map[string]any{
 			"id":       cfg.OpenAIID,
 			"object":   "model",
 			"created":  1700000000,
@@ -300,7 +296,7 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"object": "list",
 		"data":   modelList,
 	}
@@ -309,7 +305,7 @@ func (api *APIServer) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCORS handles CORS preflight requests.
-func (api *APIServer) handleCORS(w http.ResponseWriter, r *http.Request) {
+func (api *APIServer) handleCORS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id")
@@ -318,7 +314,7 @@ func (api *APIServer) handleCORS(w http.ResponseWriter, r *http.Request) {
 
 // getSessionID extracts session ID from headers or request body.
 // Priority: X-Session-Id header > session_id body field > user body field > hash(api_key + first_user_message)
-func (api *APIServer) getSessionID(r *http.Request, reqBody map[string]interface{}) string {
+func (api *APIServer) getSessionID(r *http.Request, reqBody map[string]any) string {
 	sid := r.Header.Get("X-Session-Id")
 	if sid == "" {
 		if v, ok := reqBody["session_id"].(string); ok {
@@ -340,7 +336,7 @@ func (api *APIServer) getSessionID(r *http.Request, reqBody map[string]interface
 // When auth is enabled, the hash includes the API key so that different keys
 // produce different sessions even with the same first message.
 // When auth is disabled, only the first user message is hashed.
-func (api *APIServer) hashSessionID(r *http.Request, reqBody map[string]interface{}) string {
+func (api *APIServer) hashSessionID(r *http.Request, reqBody map[string]any) string {
 	firstMsg := extractFirstUserMessage(reqBody)
 	if firstMsg == "" {
 		return ""
@@ -351,13 +347,13 @@ func (api *APIServer) hashSessionID(r *http.Request, reqBody map[string]interfac
 }
 
 // extractFirstUserMessage scans the messages array and returns the first user message content.
-func extractFirstUserMessage(reqBody map[string]interface{}) string {
-	msgs, ok := reqBody["messages"].([]interface{})
+func extractFirstUserMessage(reqBody map[string]any) string {
+	msgs, ok := reqBody["messages"].([]any)
 	if !ok || len(msgs) == 0 {
 		return ""
 	}
 	for _, m := range msgs {
-		msg, ok := m.(map[string]interface{})
+		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -371,9 +367,9 @@ func extractFirstUserMessage(reqBody map[string]interface{}) string {
 			if c != "" {
 				return c
 			}
-		case []interface{}:
+		case []any:
 			for _, block := range c {
-				bm, ok := block.(map[string]interface{})
+				bm, ok := block.(map[string]any)
 				if !ok {
 					continue
 				}
@@ -425,15 +421,15 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	r.Body.Close()
 
 	var req struct {
-		Model          string                 `json:"model"`
-		Messages       []payload.Message      `json:"messages"`
-		Stream         bool                   `json:"stream"`
-		MaxTokens      int                    `json:"max_tokens"`
-		ResponseFormat map[string]interface{} `json:"response_format"`
-		SessionID      string                 `json:"session_id"`
-		User           string                 `json:"user"`
-		Tools          []toolcalling.ToolDef  `json:"tools"`
-		ToolChoice     interface{}            `json:"tool_choice"`
+		Model          string                `json:"model"`
+		Messages       []payload.Message     `json:"messages"`
+		Stream         bool                  `json:"stream"`
+		MaxTokens      int                   `json:"max_tokens"`
+		ResponseFormat map[string]any        `json:"response_format"`
+		SessionID      string                `json:"session_id"`
+		User           string                `json:"user"`
+		Tools          []toolcalling.ToolDef `json:"tools"`
+		ToolChoice     any                   `json:"tool_choice"`
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -525,7 +521,7 @@ func (api *APIServer) handleCompletions(w http.ResponseWriter, r *http.Request) 
 		Stream     bool                  `json:"stream"`
 		MaxTokens  int                   `json:"max_tokens"`
 		Tools      []toolcalling.ToolDef `json:"tools"`
-		ToolChoice interface{}           `json:"tool_choice"`
+		ToolChoice any                   `json:"tool_choice"`
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -615,14 +611,14 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	r.Body.Close()
 
 	var req struct {
-		Model       string                 `json:"model"`
-		Messages    []payload.Message      `json:"messages"`
-		System      json.RawMessage        `json:"system"`
-		MaxTokens   int                    `json:"max_tokens"`
-		Stream      bool                   `json:"stream"`
-		Temperature float64                `json:"temperature"`
-		Tools       []toolcalling.ToolDef  `json:"tools"`
-		ToolChoice  map[string]interface{} `json:"tool_choice"`
+		Model       string                `json:"model"`
+		Messages    []payload.Message     `json:"messages"`
+		System      json.RawMessage       `json:"system"`
+		MaxTokens   int                   `json:"max_tokens"`
+		Stream      bool                  `json:"stream"`
+		Temperature float64               `json:"temperature"`
+		Tools       []toolcalling.ToolDef `json:"tools"`
+		ToolChoice  map[string]any        `json:"tool_choice"`
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -753,7 +749,7 @@ func (api *APIServer) nonStreamAnthropicComplete(w http.ResponseWriter, messages
 		}
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"completion":  respText,
 		"stop_reason": stopReason,
 		"model":       model,
@@ -790,7 +786,7 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 	logID := fmt.Sprintf("cmpl_%s", uuid.New().String())
 
 	// Send ping event (Anthropic streaming starts with ping)
-	pingData := map[string]interface{}{"type": "ping"}
+	pingData := map[string]any{"type": "ping"}
 	pingJSON, _ := json.Marshal(pingData)
 	fmt.Fprintf(w, "event: ping\ndata: %s\n\n", pingJSON)
 	flusher.Flush()
@@ -805,9 +801,9 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
-			errData := map[string]interface{}{
-				"type":    "error",
-				"error":   map[string]interface{}{"type": "server_error", "message": chunk.Error.Error()},
+			errData := map[string]any{
+				"type":  "error",
+				"error": map[string]any{"type": "server_error", "message": chunk.Error.Error()},
 			}
 			errJSON, _ := json.Marshal(errData)
 			fmt.Fprintf(w, "event: error\ndata: %s\n\n", errJSON)
@@ -838,7 +834,7 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 		fullText += chunk.Text
 
 		// Send completion event with delta text
-		compData := map[string]interface{}{
+		compData := map[string]any{
 			"type":        "completion",
 			"completion":  chunk.Text,
 			"stop_reason": nil,
@@ -864,7 +860,7 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 	}
 
 	// Send final completion event with stop_reason
-	finalData := map[string]interface{}{
+	finalData := map[string]any{
 		"type":        "completion",
 		"completion":  "",
 		"stop_reason": stopReason,
@@ -904,7 +900,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 
 	hasContent := false
 	fullText := ""
-	thinkingText := ""
+	var thinkingText strings.Builder
 	truncated := false
 
 	// When tool calling is enabled AND tools are present, buffer all text and
@@ -929,15 +925,15 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 
 		// Send thinking as reasoning_content (OpenAI extended thinking format)
 		if chunk.Thinking != "" {
-			thinkingText += chunk.Thinking
+			thinkingText.WriteString(chunk.Thinking)
 			if !hasContent {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
 					"role":              "assistant",
 					"reasoning_content": chunk.Thinking,
 				})
 				hasContent = true
 			} else {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
 					"reasoning_content": chunk.Thinking,
 				})
 			}
@@ -959,13 +955,13 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 		// If tool calling is not enabled, stream text directly
 		if !toolCallingEnabled {
 			if !hasContent {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
 					"role":    "assistant",
 					"content": chunk.Text,
 				})
 				hasContent = true
 			} else {
-				api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+				api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
 					"content": chunk.Text,
 				})
 			}
@@ -990,13 +986,13 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
 		if !hasContent {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
 				"role":    "assistant",
 				"content": fullText,
 			})
 			hasContent = true
 		} else {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
 				"content": fullText,
 			})
 		}
@@ -1024,14 +1020,14 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 
 	if len(toolCalls) > 0 {
 		if !hasContent {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
+			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
 				"role":    "assistant",
 				"content": nil,
 			})
 		}
 		for i, tc := range toolCalls {
-			api.sendSSEChunk(w, chunkID, openaiModel, map[string]interface{}{
-				"tool_calls": []map[string]interface{}{
+			api.sendSSEChunk(w, chunkID, openaiModel, map[string]any{
+				"tool_calls": []map[string]any{
 					{
 						"index": i,
 						"id":    tc.ID,
@@ -1058,8 +1054,8 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	}
 	promptTok := countTokens(promptStr)
 	completionTok := countTokens(fullText)
-	reasoningTok := countTokens(thinkingText)
-	usage := map[string]interface{}{
+	reasoningTok := countTokens(thinkingText.String())
+	usage := map[string]any{
 		"prompt_tokens":     promptTok,
 		"completion_tokens": completionTok,
 		"reasoning_tokens":  reasoningTok,
@@ -1127,7 +1123,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 		}
 	}
 
-	msg := map[string]interface{}{
+	msg := map[string]any{
 		"role":    "assistant",
 		"content": respText,
 	}
@@ -1137,9 +1133,9 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	}
 
 	if len(toolCalls) > 0 {
-		openaiToolCalls := make([]map[string]interface{}, len(toolCalls))
+		openaiToolCalls := make([]map[string]any, len(toolCalls))
 		for i, tc := range toolCalls {
-			openaiToolCalls[i] = map[string]interface{}{
+			openaiToolCalls[i] = map[string]any{
 				"index": i,
 				"id":    tc.ID,
 				"type":  "function",
@@ -1159,19 +1155,19 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 	promptTok := countTokens(promptStr)
 	completionTok := countTokens(respText)
 	reasoningTok := countTokens(thinking)
-	response := map[string]interface{}{
+	response := map[string]any{
 		"id":      fmt.Sprintf("chatcmpl-%s", uuid.New().String()),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   cfg.OpenAIID,
-		"choices": []map[string]interface{}{
+		"choices": []map[string]any{
 			{
 				"index":         0,
 				"message":       msg,
 				"finish_reason": finishReason,
 			},
 		},
-		"usage": map[string]interface{}{
+		"usage": map[string]any{
 			"prompt_tokens":     promptTok,
 			"completion_tokens": completionTok,
 			"reasoning_tokens":  reasoningTok,
@@ -1205,17 +1201,17 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	msgID := fmt.Sprintf("msg_%s", uuid.New().String())
 
 	// Send message_start event
-	header := map[string]interface{}{
+	header := map[string]any{
 		"type": "message_start",
-		"message": map[string]interface{}{
+		"message": map[string]any{
 			"id":            msgID,
 			"type":          "message",
 			"role":          "assistant",
-			"content":       []interface{}{},
+			"content":       []any{},
 			"model":         anthropicModel,
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage": map[string]interface{}{
+			"usage": map[string]any{
 				"input_tokens":  countTokens(fmt.Sprint(messages)),
 				"output_tokens": 0,
 			},
@@ -1226,7 +1222,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 	// Stream content with optional thinking block
 	fullText := ""
-	thinkingText := ""
+	var thinkingText strings.Builder
 	truncated := false
 	thinkingBlockOpen := false
 	textBlockOpen := false
@@ -1238,9 +1234,9 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
-			errEvent := map[string]interface{}{
+			errEvent := map[string]any{
 				"type": "error",
-				"error": map[string]interface{}{
+				"error": map[string]any{
 					"type":    "server_error",
 					"message": chunk.Error.Error(),
 				},
@@ -1258,20 +1254,20 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 		// Handle thinking content
 		if chunk.Thinking != "" {
-			thinkingText += chunk.Thinking
+			thinkingText.WriteString(chunk.Thinking)
 			if !thinkingBlockOpen {
-				cbStart := map[string]interface{}{
+				cbStart := map[string]any{
 					"type":          "content_block_start",
 					"index":         blockIndex,
-					"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+					"content_block": map[string]any{"type": "thinking", "thinking": ""},
 				}
 				api.sendAnthropicSSE(w, "content_block_start", cbStart)
 				thinkingBlockOpen = true
 			}
-			delta := map[string]interface{}{
+			delta := map[string]any{
 				"type":  "content_block_delta",
 				"index": blockIndex,
-				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": chunk.Thinking},
+				"delta": map[string]any{"type": "thinking_delta", "thinking": chunk.Thinking},
 			}
 			api.sendAnthropicSSE(w, "content_block_delta", delta)
 			flusher.Flush()
@@ -1280,17 +1276,17 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 		// Transition from thinking to text
 		if thinkingBlockOpen && !textBlockOpen {
-			api.sendAnthropicSSE(w, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": blockIndex})
+			api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
 			blockIndex++
 			thinkingBlockOpen = false
 		}
 
 		// Open text block on first text chunk (only if not buffering for tool calling)
 		if !textBlockOpen && !toolCallingEnabled {
-			cbStart := map[string]interface{}{
+			cbStart := map[string]any{
 				"type":          "content_block_start",
 				"index":         blockIndex,
-				"content_block": map[string]interface{}{"type": "text", "text": ""},
+				"content_block": map[string]any{"type": "text", "text": ""},
 			}
 			api.sendAnthropicSSE(w, "content_block_start", cbStart)
 			textBlockOpen = true
@@ -1308,10 +1304,10 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 		// If tool calling is not enabled, stream text deltas directly
 		if !toolCallingEnabled {
-			delta := map[string]interface{}{
+			delta := map[string]any{
 				"type":  "content_block_delta",
 				"index": blockIndex,
-				"delta": map[string]interface{}{"type": "text_delta", "text": chunk.Text},
+				"delta": map[string]any{"type": "text_delta", "text": chunk.Text},
 			}
 			api.sendAnthropicSSE(w, "content_block_delta", delta)
 			flusher.Flush()
@@ -1334,17 +1330,17 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 	// If tool calling buffered text, send it now as a text block
 	if toolCallingEnabled && fullText != "" {
-		cbStart := map[string]interface{}{
+		cbStart := map[string]any{
 			"type":          "content_block_start",
 			"index":         blockIndex,
-			"content_block": map[string]interface{}{"type": "text", "text": ""},
+			"content_block": map[string]any{"type": "text", "text": ""},
 		}
 		api.sendAnthropicSSE(w, "content_block_start", cbStart)
 		textBlockOpen = true
-		delta := map[string]interface{}{
+		delta := map[string]any{
 			"type":  "content_block_delta",
 			"index": blockIndex,
-			"delta": map[string]interface{}{"type": "text_delta", "text": fullText},
+			"delta": map[string]any{"type": "text_delta", "text": fullText},
 		}
 		api.sendAnthropicSSE(w, "content_block_delta", delta)
 		flusher.Flush()
@@ -1352,11 +1348,11 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 	// Close any open blocks
 	if thinkingBlockOpen {
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": blockIndex})
+		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
 		blockIndex++
 	}
 	if textBlockOpen {
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": blockIndex})
+		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": blockIndex})
 		blockIndex++
 	}
 
@@ -1380,22 +1376,22 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	}
 
 	for _, tc := range toolCalls {
-		var input interface{}
+		var input any
 		json.Unmarshal([]byte(tc.Function.Arguments), &input)
 		if input == nil {
-			input = map[string]interface{}{}
+			input = map[string]any{}
 		}
-		api.sendAnthropicSSE(w, "content_block_start", map[string]interface{}{
+		api.sendAnthropicSSE(w, "content_block_start", map[string]any{
 			"type":  "content_block_start",
 			"index": blockIndex,
-			"content_block": map[string]interface{}{
+			"content_block": map[string]any{
 				"type":  "tool_use",
 				"id":    tc.ID,
 				"name":  tc.Function.Name,
 				"input": input,
 			},
 		})
-		api.sendAnthropicSSE(w, "content_block_stop", map[string]interface{}{
+		api.sendAnthropicSSE(w, "content_block_stop", map[string]any{
 			"type":  "content_block_stop",
 			"index": blockIndex,
 		})
@@ -1411,22 +1407,22 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	if len(toolCalls) > 0 {
 		stopReason = "tool_use"
 	}
-	msgDelta := map[string]interface{}{
+	msgDelta := map[string]any{
 		"type": "message_delta",
-		"delta": map[string]interface{}{
+		"delta": map[string]any{
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 		},
-		"usage": map[string]interface{}{
+		"usage": map[string]any{
 			"output_tokens":    countTokens(fullText),
-			"reasoning_tokens": countTokens(thinkingText),
+			"reasoning_tokens": countTokens(thinkingText.String()),
 		},
 	}
 	api.sendAnthropicSSE(w, "message_delta", msgDelta)
 	flusher.Flush()
 
 	// Send message_stop event
-	msgStop := map[string]interface{}{"type": "message_stop"}
+	msgStop := map[string]any{"type": "message_stop"}
 	api.sendAnthropicSSE(w, "message_stop", msgStop)
 	flusher.Flush()
 
@@ -1493,22 +1489,22 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		}
 	}
 
-	content := []map[string]interface{}{}
+	content := []map[string]any{}
 	if thinking != "" {
-		content = append(content, map[string]interface{}{"type": "thinking", "thinking": thinking})
+		content = append(content, map[string]any{"type": "thinking", "thinking": thinking})
 	}
 	if respText != "" {
-		content = append(content, map[string]interface{}{"type": "text", "text": respText})
+		content = append(content, map[string]any{"type": "text", "text": respText})
 	}
 
 	if len(toolCalls) > 0 {
 		for _, tc := range toolCalls {
-			var input interface{}
+			var input any
 			json.Unmarshal([]byte(tc.Function.Arguments), &input)
 			if input == nil {
-				input = map[string]interface{}{}
+				input = map[string]any{}
 			}
-			content = append(content, map[string]interface{}{
+			content = append(content, map[string]any{
 				"type":  "tool_use",
 				"id":    tc.ID,
 				"name":  tc.Function.Name,
@@ -1517,7 +1513,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		}
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"id":            fmt.Sprintf("msg_%s", uuid.New().String()),
 		"type":          "message",
 		"role":          "assistant",
@@ -1525,7 +1521,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 		"model":         anthropicModel,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage": map[string]interface{}{
+		"usage": map[string]any{
 			"input_tokens":     countTokens(fmt.Sprint(messages)),
 			"output_tokens":    countTokens(respText),
 			"reasoning_tokens": countTokens(thinking),
@@ -1569,12 +1565,12 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
-			errChunk := map[string]interface{}{
+			errChunk := map[string]any{
 				"id":      compID,
 				"object":  "text_completion",
 				"created": time.Now().Unix(),
 				"model":   openaiModel,
-				"choices": []map[string]interface{}{
+				"choices": []map[string]any{
 					{
 						"index":         0,
 						"text":          fmt.Sprintf("Error: %v", chunk.Error),
@@ -1614,12 +1610,12 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 
 		// If tool calling is not enabled, stream text directly
 		if !toolCallingEnabled {
-			chunkData := map[string]interface{}{
+			chunkData := map[string]any{
 				"id":      compID,
 				"object":  "text_completion",
 				"created": time.Now().Unix(),
 				"model":   openaiModel,
-				"choices": []map[string]interface{}{
+				"choices": []map[string]any{
 					{
 						"index":         0,
 						"text":          chunk.Text,
@@ -1650,15 +1646,14 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 		}
 	}
 
-
 	// If tool calling buffered text, send it now as a single chunk
 	if toolCallingEnabled && fullText != "" && len(simToolCalls) == 0 {
-		chunkData := map[string]interface{}{
+		chunkData := map[string]any{
 			"id":      compID,
 			"object":  "text_completion",
 			"created": time.Now().Unix(),
 			"model":   openaiModel,
-			"choices": []map[string]interface{}{
+			"choices": []map[string]any{
 				{
 					"index":         0,
 					"text":          fullText,
@@ -1680,12 +1675,12 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	if len(simToolCalls) > 0 {
 		finishReason = "tool_calls"
 	}
-	doneChunk := map[string]interface{}{
+	doneChunk := map[string]any{
 		"id":      compID,
 		"object":  "text_completion",
 		"created": time.Now().Unix(),
 		"model":   openaiModel,
-		"choices": []map[string]interface{}{
+		"choices": []map[string]any{
 			{
 				"index":         0,
 				"text":          "",
@@ -1757,7 +1752,7 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 	reasoningTok := countTokens(thinking)
 
 	// Build choices
-	choices := []map[string]interface{}{
+	choices := []map[string]any{
 		{
 			"index":         0,
 			"text":          respText,
@@ -1767,13 +1762,13 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 	}
 
 	// Add tool calls to response if present (non-standard extension for text_completion)
-	response := map[string]interface{}{
+	response := map[string]any{
 		"id":      fmt.Sprintf("cmpl-%s", uuid.New().String()),
 		"object":  "text_completion",
 		"created": time.Now().Unix(),
 		"model":   cfg.OpenAIID,
 		"choices": choices,
-		"usage": map[string]interface{}{
+		"usage": map[string]any{
 			"prompt_tokens":     promptTok,
 			"completion_tokens": completionTok,
 			"reasoning_tokens":  reasoningTok,
@@ -1782,9 +1777,9 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 	}
 
 	if len(toolCalls) > 0 {
-		openaiToolCalls := make([]map[string]interface{}, len(toolCalls))
+		openaiToolCalls := make([]map[string]any, len(toolCalls))
 		for i, tc := range toolCalls {
-			openaiToolCalls[i] = map[string]interface{}{
+			openaiToolCalls[i] = map[string]any{
 				"index": i,
 				"id":    tc.ID,
 				"type":  "function",
@@ -1808,7 +1803,7 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 }
 
 // sendJSON sends a JSON response.
-func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(statusCode)
@@ -1818,8 +1813,8 @@ func (api *APIServer) sendJSON(w http.ResponseWriter, statusCode int, data inter
 
 // sendError sends an error response.
 func (api *APIServer) sendError(w http.ResponseWriter, statusCode int, message string) {
-	api.sendJSON(w, statusCode, map[string]interface{}{
-		"error": map[string]interface{}{
+	api.sendJSON(w, statusCode, map[string]any{
+		"error": map[string]any{
 			"message": message,
 			"type":    "error",
 			"code":    statusCode,
@@ -1828,13 +1823,13 @@ func (api *APIServer) sendError(w http.ResponseWriter, statusCode int, message s
 }
 
 // sendSSEChunk sends a Server-Sent Events chunk in OpenAI chat.completion.chunk format.
-func (api *APIServer) sendSSEChunk(w http.ResponseWriter, chunkID, model string, data map[string]interface{}) {
-	chunk := map[string]interface{}{
+func (api *APIServer) sendSSEChunk(w http.ResponseWriter, chunkID, model string, data map[string]any) {
+	chunk := map[string]any{
 		"id":      chunkID,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []map[string]interface{}{
+		"choices": []map[string]any{
 			{
 				"index":         0,
 				"delta":         data,
@@ -1848,19 +1843,19 @@ func (api *APIServer) sendSSEChunk(w http.ResponseWriter, chunkID, model string,
 }
 
 // sendSSEDone sends the final SSE chunk.
-func (api *APIServer) sendSSEDone(w http.ResponseWriter, chunkID, model, finishReason string, usage map[string]interface{}) {
+func (api *APIServer) sendSSEDone(w http.ResponseWriter, chunkID, model, finishReason string, usage map[string]any) {
 	if finishReason == "" {
 		finishReason = "stop"
 	}
-	chunk := map[string]interface{}{
+	chunk := map[string]any{
 		"id":      chunkID,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []map[string]interface{}{
+		"choices": []map[string]any{
 			{
 				"index":         0,
-				"delta":         map[string]interface{}{},
+				"delta":         map[string]any{},
 				"finish_reason": finishReason,
 			},
 		},
@@ -1877,15 +1872,15 @@ func (api *APIServer) sendSSEDone(w http.ResponseWriter, chunkID, model, finishR
 
 // sendSSEError sends an error via SSE.
 func (api *APIServer) sendSSEError(w http.ResponseWriter, chunkID, model string, err error) {
-	chunk := map[string]interface{}{
+	chunk := map[string]any{
 		"id":      chunkID,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []map[string]interface{}{
+		"choices": []map[string]any{
 			{
 				"index":         0,
-				"delta":         map[string]interface{}{"content": fmt.Sprintf("Error: %v", err)},
+				"delta":         map[string]any{"content": fmt.Sprintf("Error: %v", err)},
 				"finish_reason": "stop",
 			},
 		},
@@ -1897,7 +1892,7 @@ func (api *APIServer) sendSSEError(w http.ResponseWriter, chunkID, model string,
 }
 
 // sendAnthropicSSE sends an Anthropic-format SSE event.
-func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, data map[string]interface{}) {
+func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, data map[string]any) {
 	jsonData, _ := json.Marshal(data)
 	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, jsonData)
 }
@@ -2001,7 +1996,7 @@ func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, to
 
 // anthropicToolChoiceString normalizes the Anthropic tool_choice field to a
 // string ("any", "auto", "tool", or "") for prompt-building purposes.
-func anthropicToolChoiceString(toolChoice map[string]interface{}) string {
+func anthropicToolChoiceString(toolChoice map[string]any) string {
 	if toolChoice == nil {
 		return ""
 	}
@@ -2013,15 +2008,15 @@ func anthropicToolChoiceString(toolChoice map[string]interface{}) string {
 
 // toolChoiceString normalizes the tool_choice field to a string ("auto",
 // "required", "none", or a function name) for prompt-building purposes.
-func toolChoiceString(toolChoice interface{}) string {
+func toolChoiceString(toolChoice any) string {
 	if toolChoice == nil {
 		return ""
 	}
 	if s, ok := toolChoice.(string); ok {
 		return s
 	}
-	if m, ok := toolChoice.(map[string]interface{}); ok {
-		if fn, ok := m["function"].(map[string]interface{}); ok {
+	if m, ok := toolChoice.(map[string]any); ok {
+		if fn, ok := m["function"].(map[string]any); ok {
 			if name, ok := fn["name"].(string); ok {
 				return name
 			}
@@ -2036,11 +2031,11 @@ func toolChoiceString(toolChoice interface{}) string {
 // CLI) to encode a session ID directly in the model name, e.g.
 // "gpt5.5-reasoning:dev-test-session-001".
 func parseModelSessionID(model string) (modelKey, sessionID string) {
-	idx := strings.IndexByte(model, ':')
-	if idx < 0 {
+	modelKey, sessionID, found := strings.Cut(model, ":")
+	if !found {
 		return model, ""
 	}
-	return model[:idx], model[idx+1:]
+	return modelKey, sessionID
 }
 
 // toolNamesFromDefs extracts the function names from a slice of tool
@@ -2129,18 +2124,18 @@ func truncateToTokens(text string, maxTokens int) (string, bool) {
 
 // responsesRequest is the JSON body for POST /v1/responses.
 type responsesRequest struct {
-	Model              string                 `json:"model"`
-	Input              interface{}            `json:"input"`
-	Instructions       string                 `json:"instructions"`
-	Stream             bool                   `json:"stream"`
-	MaxOutputTokens    int                    `json:"max_output_tokens"`
-	Tools              []toolcalling.ToolDef  `json:"tools"`
-	ToolChoice         interface{}            `json:"tool_choice"`
-	Temperature        float64                `json:"temperature"`
-	PreviousResponseID string                 `json:"previous_response_id"`
-	SessionID          string                 `json:"session_id"`
-	User               string                 `json:"user"`
-	Metadata           map[string]interface{} `json:"metadata"`
+	Model              string                `json:"model"`
+	Input              any                   `json:"input"`
+	Instructions       string                `json:"instructions"`
+	Stream             bool                  `json:"stream"`
+	MaxOutputTokens    int                   `json:"max_output_tokens"`
+	Tools              []toolcalling.ToolDef `json:"tools"`
+	ToolChoice         any                   `json:"tool_choice"`
+	Temperature        float64               `json:"temperature"`
+	PreviousResponseID string                `json:"previous_response_id"`
+	SessionID          string                `json:"session_id"`
+	User               string                `json:"user"`
+	Metadata           map[string]any        `json:"metadata"`
 }
 
 // handleResponses handles OpenAI Responses API requests.
@@ -2230,7 +2225,7 @@ func (api *APIServer) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 // responsesInputToMessages converts the Responses API input field (string or
 // array of input items) to a slice of payload.Message.
-func responsesInputToMessages(input interface{}) []payload.Message {
+func responsesInputToMessages(input any) []payload.Message {
 	if input == nil {
 		return []payload.Message{{Role: "user", Content: ""}}
 	}
@@ -2241,14 +2236,14 @@ func responsesInputToMessages(input interface{}) []payload.Message {
 	}
 
 	// Array input
-	arr, ok := input.([]interface{})
+	arr, ok := input.([]any)
 	if !ok {
 		return []payload.Message{{Role: "user", Content: ""}}
 	}
 
 	var messages []payload.Message
 	for _, item := range arr {
-		m, ok := item.(map[string]interface{})
+		m, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -2304,20 +2299,20 @@ func responsesInputToMessages(input interface{}) []payload.Message {
 
 // responsesExtractContent extracts text from a content field that may be a
 // string or an array of content parts (input_text, output_text, text types).
-func responsesExtractContent(content interface{}) string {
+func responsesExtractContent(content any) string {
 	if content == nil {
 		return ""
 	}
 	if s, ok := content.(string); ok {
 		return s
 	}
-	arr, ok := content.([]interface{})
+	arr, ok := content.([]any)
 	if !ok {
 		return ""
 	}
 	var parts []string
 	for _, part := range arr {
-		p, ok := part.(map[string]interface{})
+		p, ok := part.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -2332,23 +2327,23 @@ func responsesExtractContent(content interface{}) string {
 }
 
 // buildResponsesObject constructs the non-streaming Responses API response object.
-func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, finishReason string, promptTok, completionTok, reasoningTok int) map[string]interface{} {
+func buildResponsesObject(responseID, model, text, thinking string, toolCalls []client.ToolCall, finishReason string, promptTok, completionTok, reasoningTok int) map[string]any {
 	status := "completed"
 	if finishReason == "length" {
 		status = "incomplete"
 	}
 
-	output := []map[string]interface{}{}
+	output := []map[string]any{}
 	outputIndex := 0
 
 	// Add reasoning item if thinking is present
 	if thinking != "" {
 		reasoningID := fmt.Sprintf("rs_%s", responseID)
-		output = append(output, map[string]interface{}{
+		output = append(output, map[string]any{
 			"id":     reasoningID,
 			"type":   "reasoning",
 			"status": "completed",
-			"summary": []map[string]interface{}{
+			"summary": []map[string]any{
 				{
 					"type": "summary_text",
 					"text": thinking,
@@ -2364,7 +2359,7 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 		if callID == "" {
 			callID = fmt.Sprintf("call_%d", i)
 		}
-		output = append(output, map[string]interface{}{
+		output = append(output, map[string]any{
 			"id":        callID,
 			"type":      "function_call",
 			"status":    "completed",
@@ -2378,31 +2373,31 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 	// Add message item with output_text (only if there is text content)
 	if text != "" || len(toolCalls) == 0 {
 		msgID := fmt.Sprintf("msg_%s", responseID)
-		output = append(output, map[string]interface{}{
+		output = append(output, map[string]any{
 			"id":     msgID,
 			"type":   "message",
 			"status": "completed",
 			"role":   "assistant",
-			"content": []map[string]interface{}{
+			"content": []map[string]any{
 				{
 					"type":        "output_text",
 					"text":        text,
-					"annotations": []interface{}{},
+					"annotations": []any{},
 				},
 			},
 		})
 		outputIndex++
 	}
 
-	resp := map[string]interface{}{
-		"id":         responseID,
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"status":     status,
-		"model":      model,
-		"output":     output,
+	resp := map[string]any{
+		"id":          responseID,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      status,
+		"model":       model,
+		"output":      output,
 		"output_text": text,
-		"usage": map[string]interface{}{
+		"usage": map[string]any{
 			"input_tokens":     promptTok,
 			"output_tokens":    completionTok,
 			"reasoning_tokens": reasoningTok,
@@ -2491,7 +2486,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	openaiModel := cfg.OpenAIID
 
 	// Helper to send a Responses SSE event
-	sendEvent := func(eventType string, data map[string]interface{}) {
+	sendEvent := func(eventType string, data map[string]any) {
 		data["type"] = eventType
 		jsonData, _ := json.Marshal(data)
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
@@ -2499,8 +2494,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	}
 
 	// Send response.created event
-	sendEvent("response.created", map[string]interface{}{
-		"response": map[string]interface{}{
+	sendEvent("response.created", map[string]any{
+		"response": map[string]any{
 			"id":     responseID,
 			"object": "response",
 			"status": "in_progress",
@@ -2509,8 +2504,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	})
 
 	// Send response.in_progress event
-	sendEvent("response.in_progress", map[string]interface{}{
-		"response": map[string]interface{}{
+	sendEvent("response.in_progress", map[string]any{
+		"response": map[string]any{
 			"id":     responseID,
 			"object": "response",
 			"status": "in_progress",
@@ -2521,7 +2516,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
 	fullText := ""
-	thinkingText := ""
+	var thinkingText strings.Builder
 	truncated := false
 
 	// When tool calling is enabled, buffer all text and parse at the end
@@ -2537,12 +2532,12 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
-			sendEvent("response.failed", map[string]interface{}{
-				"response": map[string]interface{}{
+			sendEvent("response.failed", map[string]any{
+				"response": map[string]any{
 					"id":     responseID,
 					"object": "response",
 					"status": "failed",
-					"error": map[string]interface{}{
+					"error": map[string]any{
 						"message": chunk.Error.Error(),
 						"type":    "server_error",
 					},
@@ -2560,17 +2555,17 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 
 		// Handle thinking/reasoning content
 		if chunk.Thinking != "" {
-			thinkingText += chunk.Thinking
+			thinkingText.WriteString(chunk.Thinking)
 
 			if !toolCallingEnabled {
 				if !reasoningItemEmitted {
-					sendEvent("response.output_item.added", map[string]interface{}{
+					sendEvent("response.output_item.added", map[string]any{
 						"output_index": 0,
-						"item": map[string]interface{}{
+						"item": map[string]any{
 							"id":     reasoningID,
 							"type":   "reasoning",
 							"status": "in_progress",
-							"summary": []map[string]interface{}{
+							"summary": []map[string]any{
 								{
 									"type": "summary_text",
 									"text": "",
@@ -2580,7 +2575,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					})
 					reasoningItemEmitted = true
 				}
-				sendEvent("response.reasoning_summary_text.delta", map[string]interface{}{
+				sendEvent("response.reasoning_summary_text.delta", map[string]any{
 					"item_id":      reasoningID,
 					"output_index": 0,
 					"delta":        chunk.Thinking,
@@ -2600,24 +2595,24 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					if reasoningItemEmitted {
 						outputIdx = 1
 					}
-					sendEvent("response.output_item.added", map[string]interface{}{
+					sendEvent("response.output_item.added", map[string]any{
 						"output_index": outputIdx,
-						"item": map[string]interface{}{
-							"id":     msgID,
-							"type":   "message",
-							"status": "in_progress",
-							"role":   "assistant",
-							"content": []interface{}{},
+						"item": map[string]any{
+							"id":      msgID,
+							"type":    "message",
+							"status":  "in_progress",
+							"role":    "assistant",
+							"content": []any{},
 						},
 					})
-					sendEvent("response.content_part.added", map[string]interface{}{
-						"item_id":      msgID,
-						"output_index": outputIdx,
+					sendEvent("response.content_part.added", map[string]any{
+						"item_id":       msgID,
+						"output_index":  outputIdx,
 						"content_index": 0,
-						"part": map[string]interface{}{
-							"type": "output_text",
-							"text": "",
-							"annotations": []interface{}{},
+						"part": map[string]any{
+							"type":        "output_text",
+							"text":        "",
+							"annotations": []any{},
 						},
 					})
 					messageItemEmitted = true
@@ -2634,7 +2629,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 							if reasoningItemEmitted {
 								outputIdx = 1
 							}
-							sendEvent("response.output_text.delta", map[string]interface{}{
+							sendEvent("response.output_text.delta", map[string]any{
 								"item_id":       msgID,
 								"output_index":  outputIdx,
 								"content_index": 0,
@@ -2656,7 +2651,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				if reasoningItemEmitted {
 					outputIdx = 1
 				}
-				sendEvent("response.output_text.delta", map[string]interface{}{
+				sendEvent("response.output_text.delta", map[string]any{
 					"item_id":       msgID,
 					"output_index":  outputIdx,
 					"content_index": 0,
@@ -2669,21 +2664,21 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 
 	// Finalize reasoning item if emitted
 	if reasoningItemEmitted && !toolCallingEnabled {
-		sendEvent("response.reasoning_summary_text.done", map[string]interface{}{
+		sendEvent("response.reasoning_summary_text.done", map[string]any{
 			"item_id":      reasoningID,
 			"output_index": 0,
-			"text":         thinkingText,
+			"text":         thinkingText.String(),
 		})
-		sendEvent("response.output_item.done", map[string]interface{}{
+		sendEvent("response.output_item.done", map[string]any{
 			"output_index": 0,
-			"item": map[string]interface{}{
+			"item": map[string]any{
 				"id":     reasoningID,
 				"type":   "reasoning",
 				"status": "completed",
-				"summary": []map[string]interface{}{
+				"summary": []map[string]any{
 					{
 						"type": "summary_text",
-						"text": thinkingText,
+						"text": thinkingText.String(),
 					},
 				},
 			},
@@ -2727,9 +2722,9 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			if callID == "" {
 				callID = fmt.Sprintf("call_%d", i)
 			}
-			sendEvent("response.output_item.added", map[string]interface{}{
+			sendEvent("response.output_item.added", map[string]any{
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
+				"item": map[string]any{
 					"id":      callID,
 					"type":    "function_call",
 					"status":  "in_progress",
@@ -2737,19 +2732,19 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 					"name":    tc.Function.Name,
 				},
 			})
-			sendEvent("response.function_call_arguments.delta", map[string]interface{}{
+			sendEvent("response.function_call_arguments.delta", map[string]any{
 				"item_id":      callID,
 				"output_index": outputIdx,
 				"delta":        tc.Function.Arguments,
 			})
-			sendEvent("response.function_call_arguments.done", map[string]interface{}{
+			sendEvent("response.function_call_arguments.done", map[string]any{
 				"item_id":      callID,
 				"output_index": outputIdx,
 				"arguments":    tc.Function.Arguments,
 			})
-			sendEvent("response.output_item.done", map[string]interface{}{
+			sendEvent("response.output_item.done", map[string]any{
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
+				"item": map[string]any{
 					"id":        callID,
 					"type":      "function_call",
 					"status":    "completed",
@@ -2771,60 +2766,60 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 				}
 			}
 
-			sendEvent("response.output_item.added", map[string]interface{}{
+			sendEvent("response.output_item.added", map[string]any{
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
-					"id":     msgID,
-					"type":   "message",
-					"status": "in_progress",
-					"role":   "assistant",
-					"content": []interface{}{},
+				"item": map[string]any{
+					"id":      msgID,
+					"type":    "message",
+					"status":  "in_progress",
+					"role":    "assistant",
+					"content": []any{},
 				},
 			})
-			sendEvent("response.content_part.added", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+			sendEvent("response.content_part.added", map[string]any{
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": "",
-					"annotations": []interface{}{},
+				"part": map[string]any{
+					"type":        "output_text",
+					"text":        "",
+					"annotations": []any{},
 				},
 			})
-			sendEvent("response.output_text.delta", map[string]interface{}{
+			sendEvent("response.output_text.delta", map[string]any{
 				"item_id":       msgID,
 				"output_index":  outputIdx,
 				"content_index": 0,
 				"delta":         fullText,
 			})
-			sendEvent("response.output_text.done", map[string]interface{}{
+			sendEvent("response.output_text.done", map[string]any{
 				"item_id":       msgID,
 				"output_index":  outputIdx,
 				"content_index": 0,
 				"text":          fullText,
 			})
-			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+			sendEvent("response.content_part.done", map[string]any{
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
-					"annotations": []interface{}{},
+				"part": map[string]any{
+					"type":        "output_text",
+					"text":        fullText,
+					"annotations": []any{},
 				},
 			})
-			sendEvent("response.output_item.done", map[string]interface{}{
+			sendEvent("response.output_item.done", map[string]any{
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
+				"item": map[string]any{
 					"id":     msgID,
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
-					"content": []map[string]interface{}{
+					"content": []map[string]any{
 						{
 							"type":        "output_text",
 							"text":        fullText,
-							"annotations": []interface{}{},
+							"annotations": []any{},
 						},
 					},
 				},
@@ -2840,34 +2835,34 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			if truncated {
 				finishReason = "length"
 			}
-			sendEvent("response.output_text.done", map[string]interface{}{
+			sendEvent("response.output_text.done", map[string]any{
 				"item_id":       msgID,
 				"output_index":  outputIdx,
 				"content_index": 0,
 				"text":          fullText,
 			})
-			sendEvent("response.content_part.done", map[string]interface{}{
-				"item_id":      msgID,
-				"output_index": outputIdx,
+			sendEvent("response.content_part.done", map[string]any{
+				"item_id":       msgID,
+				"output_index":  outputIdx,
 				"content_index": 0,
-				"part": map[string]interface{}{
-					"type": "output_text",
-					"text": fullText,
-					"annotations": []interface{}{},
+				"part": map[string]any{
+					"type":        "output_text",
+					"text":        fullText,
+					"annotations": []any{},
 				},
 			})
-			sendEvent("response.output_item.done", map[string]interface{}{
+			sendEvent("response.output_item.done", map[string]any{
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
+				"item": map[string]any{
 					"id":     msgID,
 					"type":   "message",
 					"status": "completed",
 					"role":   "assistant",
-					"content": []map[string]interface{}{
+					"content": []map[string]any{
 						{
 							"type":        "output_text",
 							"text":        fullText,
-							"annotations": []interface{}{},
+							"annotations": []any{},
 						},
 					},
 				},
@@ -2884,12 +2879,13 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	promptStr := fmt.Sprint(messages)
 	promptTok := countTokens(promptStr)
 	completionTok := countTokens(fullText)
-	reasoningTok := countTokens(thinkingText)
+	reasoningText := thinkingText.String()
+	reasoningTok := countTokens(reasoningText)
 
-	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, thinkingText, toolCalls, finishReason, promptTok, completionTok, reasoningTok)
+	finalResponse := buildResponsesObject(responseID, openaiModel, fullText, reasoningText, toolCalls, finishReason, promptTok, completionTok, reasoningTok)
 	finalResponse["status"] = status
 
-	sendEvent("response.completed", map[string]interface{}{
+	sendEvent("response.completed", map[string]any{
 		"response": finalResponse,
 	})
 
@@ -2964,7 +2960,7 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 	conversationText.WriteString(compactionInstr)
 	conversationText.WriteString("\n\n")
 	for _, m := range inputMessages {
-		conversationText.WriteString(fmt.Sprintf("%s: %s\n", m.Role, m.Content))
+		fmt.Fprintf(&conversationText, "%s: %s\n", m.Role, m.Content)
 	}
 	conversationText.WriteString("\nPlease provide the summary now.")
 
@@ -3012,9 +3008,9 @@ func (api *APIServer) handleResponsesCompact(w http.ResponseWriter, r *http.Requ
 // buildCompactionResponseObject constructs the non-streaming compact response.
 // The output contains exactly one compaction item with encrypted_content set
 // to the M365 summary text.
-func buildCompactionResponseObject(responseID, model, summaryText string, promptTok, completionTok int) map[string]interface{} {
+func buildCompactionResponseObject(responseID, model, summaryText string, promptTok, completionTok int) map[string]any {
 	compactionID := fmt.Sprintf("cmp_%s", responseID)
-	output := []map[string]interface{}{
+	output := []map[string]any{
 		{
 			"id":                compactionID,
 			"type":              "compaction",
@@ -3022,14 +3018,14 @@ func buildCompactionResponseObject(responseID, model, summaryText string, prompt
 		},
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"id":         responseID,
 		"object":     "response",
 		"created_at": time.Now().Unix(),
 		"status":     "completed",
 		"model":      model,
 		"output":     output,
-		"usage": map[string]interface{}{
+		"usage": map[string]any{
 			"input_tokens":  promptTok,
 			"output_tokens": completionTok,
 			"total_tokens":  promptTok + completionTok,
@@ -3097,7 +3093,7 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 	openaiModel := cfg.OpenAIID
 	compactionID := fmt.Sprintf("cmp_%s", responseID)
 
-	sendEvent := func(eventType string, data map[string]interface{}) {
+	sendEvent := func(eventType string, data map[string]any) {
 		data["type"] = eventType
 		jsonData, _ := json.Marshal(data)
 		fmt.Fprintf(w, "data: %s\n\n", jsonData)
@@ -3105,8 +3101,8 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 	}
 
 	// Send response.created event
-	sendEvent("response.created", map[string]interface{}{
-		"response": map[string]interface{}{
+	sendEvent("response.created", map[string]any{
+		"response": map[string]any{
 			"id":     responseID,
 			"object": "response",
 			"status": "in_progress",
@@ -3115,8 +3111,8 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 	})
 
 	// Send response.in_progress event
-	sendEvent("response.in_progress", map[string]interface{}{
-		"response": map[string]interface{}{
+	sendEvent("response.in_progress", map[string]any{
+		"response": map[string]any{
 			"id":     responseID,
 			"object": "response",
 			"status": "in_progress",
@@ -3133,13 +3129,13 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 	for chunk := range ch {
 		if chunk.Error != nil {
 			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
-			sendEvent("response.failed", map[string]interface{}{
-				"response": map[string]interface{}{
+			sendEvent("response.failed", map[string]any{
+				"response": map[string]any{
 					"id":     responseID,
 					"object": "response",
 					"status": "failed",
 					"model":  openaiModel,
-					"error":  map[string]interface{}{"message": chunk.Error.Error()},
+					"error":  map[string]any{"message": chunk.Error.Error()},
 				},
 			})
 			fmt.Fprintf(w, "data: [DONE]\n\n")
@@ -3168,17 +3164,17 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 	}
 
 	// Emit the compaction output item
-	sendEvent("response.output_item.added", map[string]interface{}{
+	sendEvent("response.output_item.added", map[string]any{
 		"output_index": 0,
-		"item": map[string]interface{}{
+		"item": map[string]any{
 			"id":   compactionID,
 			"type": "compaction",
 		},
 	})
 
-	sendEvent("response.output_item.done", map[string]interface{}{
+	sendEvent("response.output_item.done", map[string]any{
 		"output_index": 0,
-		"item": map[string]interface{}{
+		"item": map[string]any{
 			"id":                compactionID,
 			"type":              "compaction",
 			"encrypted_content": fullText,
@@ -3192,7 +3188,7 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	finalResponse := buildCompactionResponseObject(responseID, openaiModel, fullText, promptTok, completionTok)
 
-	sendEvent("response.completed", map[string]interface{}{
+	sendEvent("response.completed", map[string]any{
 		"response": finalResponse,
 	})
 
@@ -3290,7 +3286,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	api.sendJSON(w, http.StatusOK, map[string]interface{}{
+	api.sendJSON(w, http.StatusOK, map[string]any{
 		"created": time.Now().Unix(),
 		"data":    dataItems,
 	})
@@ -3459,7 +3455,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api.sendJSON(w, http.StatusOK, map[string]interface{}{
+	api.sendJSON(w, http.StatusOK, map[string]any{
 		"created": time.Now().Unix(),
 		"data":    dataItems,
 	})

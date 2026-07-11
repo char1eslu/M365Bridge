@@ -305,7 +305,7 @@ Then follow Steps 3-6 above.
 | Flag            | Type   | Default | Description                                                              |
 |-----------------|--------|---------|--------------------------------------------------------------------------|
 | `-i`            | bool   | false   | Interactive mode (multi-turn conversation)                               |
-| `--model`       | string | `auto`  | Model to use: `auto`, `quick`, `reasoning`, `gpt5.5`, `gpt5.5-reasoning`, `gpt5.6-reasoning` |
+| `--model`       | string | `auto`  | Model to use: `auto`, `quick`, `reasoning`, `gpt5.5`, `gpt5.5-reasoning`, `gpt5.6-reasoning`, `claude`, `claude-sonnet`, `claude-opus`, `claude-fable`, `claude-sonnet-4-20250514` |
 | `--reasoning`   | bool   | false   | Use reasoning mode                                                       |
 | `--no-stream`   | bool   | false   | Disable streaming, print full response at once                           |
 | `--list-models` | bool   | false   | List all available models and exit                                       |
@@ -485,7 +485,7 @@ print(resp.choices[0].message.content)
 
 ## Models
 
-All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models. GPT-5.x models route to the GPT-5 backend; Claude models route to real Anthropic Claude models (verified via tone test).
+All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models. GPT-5.x models route to the GPT-5 backend. Claude tone values return Claude responses, but M365 does not expose the underlying model identity in SignalR metadata.
 
 | Key                        | Tone              | OpenAI ID         | Thinking? | Backend |
 |----------------------------|-------------------|-------------------|-----------|---------|
@@ -498,6 +498,7 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | No        | Claude  |
+| `claude-fable`             | Claude_Fable      | claude-fable-5    | No        | Claude  |
 | `claude-sonnet-4-20250514` | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 
 ### Which model should I use?
@@ -512,6 +513,7 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | GPT-5.6 with deep thinking (latest)          | `gpt5.6-reasoning` |
 | Claude Sonnet 4.6 (Anthropic)                | `claude-sonnet`    |
 | Claude Opus 4.6 (Anthropic, most capable)    | `claude-opus`      |
+| Claude Fable tone                            | `claude-fable`     |
 
 `gpt5.5-reasoning` produces `reasoning_content` output containing the model's thinking process. OpenAI endpoints expose this as `reasoning_content`; Anthropic endpoints expose it as a `thinking` content block before the `text` block. Claude models do not produce reasoning content.
 

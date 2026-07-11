@@ -230,7 +230,7 @@ func (c *M365Client) Chat(text, tone, gptOverride, conversationID, userOID, tena
 // ChatStream sends a message and streams the response to stdout.
 // Returns the complete text.
 func (c *M365Client) ChatStream(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, error) {
-	fullText := ""
+	var fullText strings.Builder
 
 	ch := c.ChatStreamGen(text, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
 	for chunk := range ch {
@@ -238,11 +238,11 @@ func (c *M365Client) ChatStream(text, tone, gptOverride, conversationID, userOID
 			return "", chunk.Error
 		}
 		if !chunk.IsFinal {
-			fullText += chunk.Text
+			fullText.WriteString(chunk.Text)
 		}
 	}
 
-	return fullText, nil
+	return fullText.String(), nil
 }
 
 // StreamChunk represents a chunk of streamed response.
@@ -357,7 +357,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 					continue
 				}
 
-				var data map[string]interface{}
+				var data map[string]any
 				if err := json.Unmarshal([]byte(part), &data); err != nil {
 					continue
 				}
@@ -378,19 +378,19 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 				}
 				if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 					if target, ok := data["target"].(string); ok && target == "update" {
-						if args, ok := data["arguments"].([]interface{}); ok {
+						if args, ok := data["arguments"].([]any); ok {
 							for _, arg := range args {
-								if argMap, ok := arg.(map[string]interface{}); ok {
+								if argMap, ok := arg.(map[string]any); ok {
 									// DEBUG: log all keys in argMap
 									logging.Debugf("ConvStream argMap keys: %v", mapKeys(argMap))
 									// Extract conversationId from type:1 update if present (rare)
 									if convID, ok := argMap["conversationId"].(string); ok && convID != "" {
 										finalConvID = convID
 									}
-									if msgs, ok := argMap["messages"].([]interface{}); ok {
+									if msgs, ok := argMap["messages"].([]any); ok {
 										// DEBUG: log all messages' messageType and contentOrigin
 										for _, msg := range msgs {
-											if msgMap, ok := msg.(map[string]interface{}); ok {
+											if msgMap, ok := msg.(map[string]any); ok {
 												mt, _ := msgMap["messageType"].(string)
 												co, _ := msgMap["contentOrigin"].(string)
 												logging.Debugf("ConvWS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
@@ -398,7 +398,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 										}
 										// Check all messages for tool calls and thinking
 										for _, msg := range msgs {
-											if msgMap, ok := msg.(map[string]interface{}); ok {
+											if msgMap, ok := msg.(map[string]any); ok {
 												if messageType, ok := msgMap["messageType"].(string); ok {
 													if funcName, exists := models.ToolMessageType[messageType]; exists {
 														if tc := extractToolCall(msgMap, funcName); tc != nil {
@@ -421,7 +421,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 															}
 														}
 														// Extract web search tool calls from searchQueries field
-														if sq, ok := msgMap["searchQueries"].([]interface{}); ok && len(sq) > 0 {
+														if sq, ok := msgMap["searchQueries"].([]any); ok && len(sq) > 0 {
 															for _, q := range sq {
 																if query, ok := q.(string); ok && query != "" {
 																	tc := makeSearchToolCall(query, msgMap)
@@ -435,7 +435,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 										}
 										// Only process text from the last message (skip Progress messages)
 										if len(msgs) > 0 {
-											if lastMsg, ok := msgs[len(msgs)-1].(map[string]interface{}); ok {
+											if lastMsg, ok := msgs[len(msgs)-1].(map[string]any); ok {
 												if lastMsgType, _ := lastMsg["messageType"].(string); lastMsgType != "Progress" {
 													if newText, ok := lastMsg["text"].(string); ok && newText != "" {
 														if newText != accText {
@@ -465,7 +465,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 					}
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 2 {
 					// type: 2 is invocation completion; contains item.conversationId
-					if item, ok := data["item"].(map[string]interface{}); ok {
+					if item, ok := data["item"].(map[string]any); ok {
 						if convID, ok := item["conversationId"].(string); ok && convID != "" {
 							finalConvID = convID
 						}
@@ -521,18 +521,18 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 				continue
 			}
 
-			var data map[string]interface{}
+			var data map[string]any
 			if err := json.Unmarshal([]byte(part), &data); err != nil {
 				continue
 			}
 
 			if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 				if target, ok := data["target"].(string); ok && target == "update" {
-					if args, ok := data["arguments"].([]interface{}); ok {
+					if args, ok := data["arguments"].([]any); ok {
 						for _, arg := range args {
-							if argMap, ok := arg.(map[string]interface{}); ok {
-								if msgs, ok := argMap["messages"].([]interface{}); ok && len(msgs) > 0 {
-									if lastMsg, ok := msgs[len(msgs)-1].(map[string]interface{}); ok {
+							if argMap, ok := arg.(map[string]any); ok {
+								if msgs, ok := argMap["messages"].([]any); ok && len(msgs) > 0 {
+									if lastMsg, ok := msgs[len(msgs)-1].(map[string]any); ok {
 										if text, ok := lastMsg["text"].(string); ok {
 											fullText = text
 										}
@@ -550,7 +550,7 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 }
 
 // extractToolCall extracts a tool call from a message.
-func extractToolCall(msg map[string]interface{}, funcName string) *ToolCall {
+func extractToolCall(msg map[string]any, funcName string) *ToolCall {
 	messageType, _ := msg["messageType"].(string)
 	text, _ := msg["text"].(string)
 
@@ -597,7 +597,7 @@ func generateUUID() string {
 
 // makeSearchToolCall creates a ToolCall for a web search query extracted from
 // the searchQueries field of a Progress message.
-func makeSearchToolCall(query string, msg map[string]interface{}) *ToolCall {
+func makeSearchToolCall(query string, msg map[string]any) *ToolCall {
 	argsMap := map[string]string{"query": query}
 	argsBytes, _ := json.Marshal(argsMap)
 
@@ -655,15 +655,15 @@ func cleanText(text string) string {
 // with contentOrigin "ImageGeneration" and returns them as markdown image links.
 // seenImages tracks already-emitted URLs to avoid duplicates (M365 sends the
 // same URL in multiple Progress updates as the image generation completes).
-func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[string]bool) string {
-	progressList, ok := msg["contentGenerationProgressList"].([]interface{})
+func extractImageGenerationMarkdown(msg map[string]any, seenImages map[string]bool) string {
+	progressList, ok := msg["contentGenerationProgressList"].([]any)
 	if !ok {
 		return ""
 	}
 
 	var parts []string
 	for _, item := range progressList {
-		itemMap, ok := item.(map[string]interface{})
+		itemMap, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -675,7 +675,7 @@ func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[s
 			}
 			logging.Debugf("ImageGen progress item JSON: %s", s)
 		}
-		urls, ok := itemMap["ImageReferenceUrls"].([]interface{})
+		urls, ok := itemMap["ImageReferenceUrls"].([]any)
 		if !ok {
 			continue
 		}
@@ -697,7 +697,7 @@ func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[s
 }
 
 // mapKeys returns the keys of a map as a slice (for debug logging).
-func mapKeys(m map[string]interface{}) []string {
+func mapKeys(m map[string]any) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

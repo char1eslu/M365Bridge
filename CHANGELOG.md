@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.5] - 2026-07-12
+
+### Added
+- Harden the OpenAI Responses API for Codex: simulated tool-call retries, namespaced tools, ordered `response.failed` and `[DONE]` terminal events, and client-disconnect cancellation of upstream M365 streams
+
+### Changed
+- Modernize the codebase for the gopls modernize analyzer and enforce it as a CI job
+- Harden the CI and release supply chain: pin GitHub Actions to commit SHAs, pin Docker base images by digest, add least-privilege workflow permissions, and add Dependabot
+
+### Fixed
+- Lowercase Responses tool policy error strings to satisfy Staticcheck
+- Retry empty and required-tool Responses completions before failing
+- Fix M365 chat routing for education tenants
+
 ## [1.3.1] - 2026-07-12
 
 ### Added

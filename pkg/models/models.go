@@ -13,7 +13,7 @@ import (
 
 // Version is the application version, shared across all binaries.
 // Overridable at build time via ldflags: -X github.com/KilimcininKorOglu/M365Bridge/pkg/models.Version=x.y.z
-var Version = "1.3.1"
+var Version = "1.3.6"
 
 const (
 	// DefaultClientID is the default Microsoft 365 Copilot client ID.
@@ -145,7 +145,7 @@ func LoadConfig() *Config {
 func parseAPIKeys(keysCSV, singleKey string) []string {
 	if keysCSV != "" {
 		var keys []string
-		for _, k := range strings.Split(keysCSV, ",") {
+		for k := range strings.SplitSeq(keysCSV, ",") {
 			k = strings.TrimSpace(k)
 			if k != "" {
 				keys = append(keys, k)
@@ -171,7 +171,7 @@ func loadDotEnv() {
 		}
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

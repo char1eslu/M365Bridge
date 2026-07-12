@@ -54,6 +54,15 @@ type SSOCookieStore struct {
 	CapturedAt time.Time   `json:"capturedAt"`
 }
 
+// m365CookieStore holds browser cookies used by M365 web APIs.
+type m365CookieStore struct {
+	Domain      string      `json:"domain"`
+	ExtractedAt time.Time   `json:"extracted_at"`
+	Cookies     []SSOCookie `json:"cookies"`
+}
+
+var renameFile = os.Rename
+
 // generatePKCE creates a PKCE code verifier and code challenge (S256).
 func generatePKCE() (verifier, challenge string, err error) {
 	verifierBytes := make([]byte, 32)
@@ -95,27 +104,63 @@ func SaveSSOCookies(cookies []SSOCookie) error {
 	return os.WriteFile(ssoCookiesFile, []byte(encrypted), 0600)
 }
 
-// SaveM365Cookies stores browser cookies used by M365 web APIs.
+// SaveM365Cookies encrypts and stores browser cookies used by M365 web APIs.
 func SaveM365Cookies(cookies []SSOCookie) error {
-	store := struct {
-		Domain      string      `json:"domain"`
-		ExtractedAt time.Time   `json:"extracted_at"`
-		Cookies     []SSOCookie `json:"cookies"`
-	}{
+	store := m365CookieStore{
 		Domain:      "m365.cloud.microsoft",
 		ExtractedAt: time.Now(),
 		Cookies:     cookies,
 	}
+	return saveM365CookieStore(store)
+}
 
-	data, err := json.MarshalIndent(store, "", "  ")
+func saveM365CookieStore(store m365CookieStore) error {
+	data, err := json.Marshal(store)
 	if err != nil {
 		return fmt.Errorf("failed to marshal M365 cookies: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(m365CookiesFile), 0700); err != nil {
-		return fmt.Errorf("failed to create M365 cookie directory: %w", err)
+	encrypted, err := crypto.Encrypt(string(data))
+	if err != nil {
+		return fmt.Errorf("failed to encrypt M365 cookies: %w", err)
 	}
-	if err := os.WriteFile(m365CookiesFile, data, 0600); err != nil {
+	if err := atomicWriteFile(m365CookiesFile, []byte(encrypted), 0600); err != nil {
 		return fmt.Errorf("failed to save M365 cookies: %w", err)
+	}
+	return nil
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) (returnErr error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	temporary, err := os.CreateTemp(dir, ".m365-cookies-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		if returnErr != nil {
+			temporary.Close()
+			os.Remove(temporaryPath)
+		}
+	}()
+
+	if err := temporary.Chmod(mode); err != nil {
+		return fmt.Errorf("failed to set temporary file permissions: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temporary file: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file: %w", err)
+	}
+	if err := renameFile(temporaryPath, path); err != nil {
+		return fmt.Errorf("failed to replace file: %w", err)
 	}
 	return nil
 }
@@ -146,18 +191,47 @@ func hasSSOCookies() bool {
 	return err == nil
 }
 
-// M365CookieHeader returns cookies scoped to the M365 web application.
-func (tm *TokenManager) M365CookieHeader() (string, error) {
+func loadM365CookieStore() (*m365CookieStore, error) {
 	data, err := os.ReadFile(m365CookiesFile)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
+		return nil, fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
 	}
 
-	var store struct {
+	decrypted, decryptErr := crypto.Decrypt(string(data))
+	if decryptErr == nil {
+		var store m365CookieStore
+		if err := json.Unmarshal([]byte(decrypted), &store); err != nil {
+			return nil, fmt.Errorf("%w: failed to parse decrypted M365 cookies: %v", ErrM365CookiesUnavailable, err)
+		}
+		return &store, nil
+	}
+
+	var legacyData struct {
+		Domain  string      `json:"domain"`
 		Cookies []SSOCookie `json:"cookies"`
 	}
-	if err := json.Unmarshal(data, &store); err != nil {
-		return "", fmt.Errorf("%w: failed to parse M365 cookies: %v", ErrM365CookiesUnavailable, err)
+	if err := json.Unmarshal(data, &legacyData); err != nil {
+		return nil, fmt.Errorf("%w: failed to decrypt M365 cookies: %v", ErrM365CookiesUnavailable, decryptErr)
+	}
+	if legacyData.Domain == "" || legacyData.Cookies == nil {
+		return nil, fmt.Errorf("%w: invalid legacy M365 cookie store", ErrM365CookiesUnavailable)
+	}
+	legacyStore := m365CookieStore{
+		Domain:      legacyData.Domain,
+		ExtractedAt: time.Now(),
+		Cookies:     legacyData.Cookies,
+	}
+	if err := saveM365CookieStore(legacyStore); err != nil {
+		return nil, fmt.Errorf("%w: failed to migrate M365 cookies: %v", ErrM365CookiesUnavailable, err)
+	}
+	return &legacyStore, nil
+}
+
+// M365CookieHeader returns cookies scoped to the M365 web application.
+func (tm *TokenManager) M365CookieHeader() (string, error) {
+	store, err := loadM365CookieStore()
+	if err != nil {
+		return "", err
 	}
 
 	var cookieParts []string

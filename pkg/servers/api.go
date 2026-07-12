@@ -2451,9 +2451,9 @@ func toolNamesFromDefs(tools []toolcalling.ToolDef) []string {
 		return nil
 	}
 	names := make([]string, 0, len(tools))
-	for _, t := range tools {
-		if t.Function.Name != "" {
-			names = append(names, t.Function.Name)
+	for i := range tools {
+		if name := toolcalling.ToolName(&tools[i]); name != "" {
+			names = append(names, name)
 		}
 	}
 	return names
@@ -2681,9 +2681,9 @@ func responsesInputToMessages(input any) []payload.Message {
 			callID, _ := m["call_id"].(string)
 			output, _ := m["output"].(string)
 			messages = append(messages, payload.Message{
-				Role:    "tool",
-				Content: output,
-				Name:    callID,
+				Role:       "tool",
+				Content:    fmt.Sprintf("[Tool Result (call_id: %s)]\n%s", callID, output),
+				ToolCallID: callID,
 			})
 			continue
 		}

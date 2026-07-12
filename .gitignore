@@ -6,8 +6,8 @@ m365-bridge
 data/
 test_logs/*
 __pycache__/*
-*.py
 
 # Docker
 docker-data/
 webui_analysis.md
+encryption.key

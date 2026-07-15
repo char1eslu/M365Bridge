@@ -570,6 +570,18 @@ type toolLoopResult struct {
 	conversationID string
 }
 
+func clientToolCallFromSimulated(call toolcalling.ToolCall) client.ToolCall {
+	return client.ToolCall{
+		ID:   call.ID,
+		Type: "function",
+		Function: client.ToolCallFunction{
+			Name:      call.Name,
+			Namespace: call.Namespace,
+			Arguments: string(call.Arguments),
+		},
+	}
+}
+
 func (api *APIServer) prepareCodingTools(tools []toolcalling.ToolDef, anthropic bool) ([]toolcalling.ToolDef, map[string]bool) {
 	local := make(map[string]bool)
 	if api.codeTools == nil {
@@ -649,7 +661,7 @@ func (api *APIServer) runToolLoop(r *http.Request, provider toolLoopProvider, me
 		var callerCalls []client.ToolCall
 		var localCalls []toolcalling.ToolCall
 		for _, call := range simulated.ToolCalls {
-			converted := client.ToolCall{ID: call.ID, Type: "function", Function: client.ToolCallFunction{Name: call.Name, Arguments: string(call.Arguments)}}
+			converted := clientToolCallFromSimulated(call)
 			if local[call.Name] {
 				localCalls = append(localCalls, call)
 			} else {
@@ -1436,7 +1448,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 		toolCalls = append(toolCalls, client.ToolCall{
 			ID:       stc.ID,
 			Type:     "function",
-			Function: client.ToolCallFunction{Name: stc.Name, Arguments: string(stc.Arguments)},
+			Function: client.ToolCallFunction{Name: stc.Name, Namespace: stc.Namespace, Arguments: string(stc.Arguments)},
 		})
 	}
 
@@ -1566,7 +1578,7 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 					toolCalls = append(toolCalls, client.ToolCall{
 						ID:       pc.ID,
 						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
 					})
 				}
 				respText = ""
@@ -1888,7 +1900,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		toolCalls = append(toolCalls, client.ToolCall{
 			ID:       stc.ID,
 			Type:     "function",
-			Function: client.ToolCallFunction{Name: stc.Name, Arguments: string(stc.Arguments)},
+			Function: client.ToolCallFunction{Name: stc.Name, Namespace: stc.Namespace, Arguments: string(stc.Arguments)},
 		})
 	}
 
@@ -2051,7 +2063,7 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 					toolCalls = append(toolCalls, client.ToolCall{
 						ID:       pc.ID,
 						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
 					})
 				}
 				respText = ""
@@ -2319,7 +2331,7 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 					toolCalls = append(toolCalls, client.ToolCall{
 						ID:       pc.ID,
 						Type:     "function",
-						Function: client.ToolCallFunction{Name: pc.Name, Arguments: string(pc.Arguments)},
+						Function: client.ToolCallFunction{Name: pc.Name, Namespace: pc.Namespace, Arguments: string(pc.Arguments)},
 					})
 				}
 				respText = ""
@@ -2823,11 +2835,23 @@ func responsesToolDefsFromRawNamespace(raw any, inheritedNamespace string) []too
 		if namespace == "" {
 			namespace = inheritedNamespace
 		}
-		definitions = append(definitions, toolcalling.ToolDef{
-			Type:      toolType,
-			Name:      name,
-			Namespace: namespace,
-		})
+		description, _ := tool["description"].(string)
+		definition := toolcalling.ToolDef{
+			Type:        toolType,
+			Name:        name,
+			Namespace:   namespace,
+			Description: description,
+		}
+		if parameters, ok := tool["parameters"].(map[string]any); ok {
+			definition.Parameters = parameters
+		}
+		if inputSchema, ok := tool["input_schema"].(map[string]any); ok {
+			definition.InputSchema = inputSchema
+		}
+		if nestedTools, ok := tool["tools"].([]any); ok {
+			definition.Tools = responsesToolDefsFromRawNamespace(nestedTools, namespace)
+		}
+		definitions = append(definitions, definition)
 	}
 	return definitions
 }
